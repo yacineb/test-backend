@@ -42,6 +42,45 @@ class DocumentResponse(BaseModel):
     created_at: datetime
 
 
+class UploaderResponse(BaseModel):
+    """The user who imported the document.
+
+    Nested rather than flattened into `uploaded_by_id`/`uploaded_by_name`/…
+    because it is one entity, and because a listing that returned only a UUID
+    would push every client into an N+1 lookup to render a name.
+    """
+
+    id: UUID
+    full_name: str
+    email: str
+
+
+class DocumentSummaryResponse(BaseModel):
+    """A row of the document index. Deliberately narrower than
+    `DocumentResponse`: content type, size and digest are upload facts, not
+    things a list view shows."""
+
+    id: UUID
+    filename: str
+    # Processing status. Only "uploaded" is reachable until the pipeline lands;
+    # a string rather than an enum so new states do not break old clients.
+    status: str
+    uploaded_by: UploaderResponse
+    created_at: datetime
+
+
+class DocumentPageResponse(BaseModel):
+    """One page of documents, newest first.
+
+    `next_cursor` is null on the last page. It is derived from a row that was
+    actually read, so it never points at an empty page — a client can loop
+    until it is null without a trailing empty request.
+    """
+
+    items: list[DocumentSummaryResponse]
+    next_cursor: str | None = None
+
+
 class MeResponse(BaseModel):
     user_id: UUID
     org_id: UUID

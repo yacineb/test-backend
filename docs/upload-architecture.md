@@ -309,8 +309,10 @@ exactly why `tests/integration/test_document_isolation.py` asserts through
 deliberately *unfiltered* SQL. If those tests pass, Postgres is doing
 independent work rather than the `WHERE` clause doing all of it.
 
-The listing endpoint gets isolation from the same place: `list_recent` takes no
-org parameter at all, because the repository already carries one.
+The listing endpoint gets isolation from the same place: `list_page` takes no
+org parameter at all, because the repository already carries one. How that
+listing pages is a separate question, answered in
+[docs/document-listing.md](document-listing.md).
 
 ## 6. What is verified
 

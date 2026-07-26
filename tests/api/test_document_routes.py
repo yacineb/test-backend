@@ -6,6 +6,7 @@ row-level security in tests/integration.
 """
 
 from collections.abc import Iterator
+from dataclasses import replace
 from datetime import UTC, datetime
 from uuid import uuid4
 
@@ -15,7 +16,7 @@ from fastapi.testclient import TestClient
 from app.api.deps import get_document_repository, get_token_service, get_upload_deps
 from app.domain.auth import AuthContext
 from app.main import app
-from tests.fakes import make_token_service, make_upload_deps, pdf_bytes
+from tests.fakes import make_token_service, make_upload_deps, make_user, pdf_bytes
 
 ORG = uuid4()
 OTHER_ORG = uuid4()
@@ -23,10 +24,14 @@ USER = uuid4()
 MAX_BYTES = 1024
 PDF = pdf_bytes(b"pdf bytes")
 
+# The listing joins documents to their uploader, so the fake needs the user the
+# token names to exist.
+UPLOADER = replace(make_user(org_id=ORG), id=USER)
+
 
 @pytest.fixture
 def wiring():
-    return make_upload_deps(ORG, max_bytes=MAX_BYTES)
+    return make_upload_deps(ORG, max_bytes=MAX_BYTES, uploaders=[UPLOADER])
 
 
 @pytest.fixture
@@ -211,17 +216,125 @@ def test_listing_requires_a_token(client):
     assert client.get("/documents").status_code == 401
 
 
-def test_listing_returns_the_stored_documents_newest_first(client):
-    for name in ("first", "second", "third"):
-        client.post(
+def store(client: TestClient, *names: str) -> None:
+    for name in names:
+        response = client.post(
             "/documents",
             headers=auth(),
             files={"file": (f"{name}.pdf", PDF, "application/pdf")},
         )
+        assert response.status_code == 201, response.text
 
-    listed = client.get("/documents", headers=auth()).json()
 
-    assert [d["filename"] for d in listed] == ["third.pdf", "second.pdf", "first.pdf"]
+def filenames(page: dict) -> list[str]:
+    return [item["filename"] for item in page["items"]]
+
+
+def test_listing_returns_the_stored_documents_newest_first(client):
+    store(client, "first", "second", "third")
+
+    page = client.get("/documents", headers=auth()).json()
+
+    assert filenames(page) == ["third.pdf", "second.pdf", "first.pdf"]
+    assert page["next_cursor"] is None
+
+
+def test_a_listed_row_carries_the_fields_the_index_shows(client):
+    store(client, "report")
+
+    item = client.get("/documents", headers=auth()).json()["items"][0]
+
+    assert item["filename"] == "report.pdf"
+    assert item["status"] == "uploaded"
+    assert item["uploaded_by"] == {
+        "id": str(USER),
+        "full_name": UPLOADER.full_name,
+        "email": UPLOADER.email,
+    }
+    assert item["created_at"]
+    assert item["id"]
+    # Upload facts, not index facts.
+    assert "sha256" not in item
+    assert "storage_key" not in item
+
+
+def test_paging_walks_every_document_exactly_once(client):
+    store(client, *(f"doc{n}" for n in range(7)))
+
+    seen: list[str] = []
+    cursor = None
+    for _ in range(10):  # Bounded so a broken cursor fails rather than hangs.
+        params = {"limit": 2} | ({"cursor": cursor} if cursor else {})
+        page = client.get("/documents", headers=auth(), params=params).json()
+        assert len(page["items"]) <= 2
+        seen += filenames(page)
+        cursor = page["next_cursor"]
+        if cursor is None:
+            break
+
+    assert cursor is None
+    assert seen == [f"doc{n}.pdf" for n in reversed(range(7))]
+
+
+def test_the_last_full_page_does_not_promise_another_one(client):
+    """next_cursor comes from a row that was read, so it never leads nowhere."""
+    store(client, "one", "two")
+
+    page = client.get("/documents", headers=auth(), params={"limit": 2}).json()
+
+    assert len(page["items"]) == 2
+    assert page["next_cursor"] is None
+
+
+def test_an_empty_listing_has_no_cursor(client):
+    page = client.get("/documents", headers=auth()).json()
+
+    assert page == {"items": [], "next_cursor": None}
+
+
+def test_a_document_uploaded_mid_scroll_does_not_shift_the_page(client):
+    """The offset failure this design exists to avoid: with OFFSET 1, inserting
+    at the head would push `second` back into view and hide `first`."""
+    store(client, "first", "second")
+    first_page = client.get("/documents", headers=auth(), params={"limit": 1}).json()
+    assert filenames(first_page) == ["second.pdf"]
+
+    store(client, "third")
+
+    rest = client.get(
+        "/documents",
+        headers=auth(),
+        params={"limit": 10, "cursor": first_page["next_cursor"]},
+    ).json()
+
+    assert filenames(rest) == ["first.pdf"]
+
+
+def test_a_forged_cursor_is_a_400_not_a_500(client):
+    response = client.get("/documents", headers=auth(), params={"cursor": "garbage"})
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "invalid cursor"
+
+
+def test_limit_is_bounded(client):
+    assert (
+        client.get("/documents", headers=auth(), params={"limit": 0}).status_code == 422
+    )
+    assert (
+        client.get("/documents", headers=auth(), params={"limit": 201}).status_code
+        == 422
+    )
+
+
+def test_offset_is_gone(client):
+    """Replaced deliberately, not accidentally: a stray offset must not silently
+    page from somewhere unexpected."""
+    store(client, "first", "second")
+
+    page = client.get("/documents", headers=auth(), params={"offset": 1}).json()
+
+    assert filenames(page) == ["second.pdf", "first.pdf"]
 
 
 def test_upload_appears_in_the_openapi_schema_as_secured(client):

@@ -143,7 +143,7 @@ app/config.py        settings, all env-driven
 app/seed.py          idempotent development seed
 app/main.py          app factory and the /health endpoint
 scripts/             simulate_pipeline.py — where the latency numbers come from
-migrations/          Alembic; 0001 schema, roles and RLS policies; 0002 documents
+migrations/          Alembic; 0001 schema/roles/RLS; 0002 documents; 0003 pipeline; 0004 listing index
 tests/unit/          use cases against in-memory fakes
 tests/api/           routes with the adapters overridden
 tests/integration/   real Postgres; proves RLS. Skipped without TEST_POSTGRES_DSN
@@ -194,6 +194,11 @@ rather than evidence. A PNG renamed `report.pdf` and declared `application/pdf`
 gets a `415`. The sniffed type is what gets recorded, so a genuine PDF uploaded
 as `application/octet-stream` is stored as `application/pdf`.
 
+The listing is newest-first and paged by cursor, not offset: pass the previous
+response's `next_cursor` back as `?cursor=`, and stop when it comes back null.
+Each row carries the document's name, id, processing status, import date, and
+the user who imported it (id, name, email, from a join to `users`).
+
 | variable | default | meaning |
 |---|---|---|
 | `STORAGE_ROOT` | `/data/uploads` | where the POSIX backend writes; a compose volume |
@@ -205,7 +210,10 @@ For a host-side run, point `STORAGE_ROOT` somewhere writable (`STORAGE_ROOT=./va
 
 The rationale — the storage port's atomicity contract, why the size limit is
 enforced in two places, and when to move to presigned S3 uploads — is in
-[docs/upload-architecture.md](docs/upload-architecture.md).
+[docs/upload-architecture.md](docs/upload-architecture.md). The read side —
+why keyset paging, what is in the cursor, the measured cost against 2M rows,
+and why GraphQL is the better long-term shape — is in
+[docs/document-listing.md](docs/document-listing.md).
 
 `[tool.uv] package = false` — this is an application, not a library, so nothing
 is built or installed as a package. `pytest` finds `app/` via

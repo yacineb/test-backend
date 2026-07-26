@@ -18,8 +18,11 @@ from app.domain.auth import RefreshToken
 from app.domain.document import (
     STEPS,
     Document,
+    DocumentCursor,
+    DocumentPage,
     DocumentStatus,
     DocumentStep,
+    DocumentSummary,
     Step,
     StepStatus,
 )
@@ -40,11 +43,20 @@ class FakeClock:
     advance(); only the offsets matter.
     """
 
-    def __init__(self, now: datetime | None = None) -> None:
+    def __init__(
+        self, now: datetime | None = None, tick: timedelta = timedelta()
+    ) -> None:
         self._now = now or datetime.now(UTC)
+        # Advance per reading. Zero by default, so nothing that pins time is
+        # affected; the upload deps set it, because two documents created at
+        # the identical microsecond is not the case worth defaulting to when
+        # the listing sorts on exactly that column.
+        self._tick = tick
 
     def now(self) -> datetime:
-        return self._now
+        current = self._now
+        self._now += self._tick
+        return current
 
     def advance(self, delta: timedelta) -> None:
         self._now += delta
@@ -194,9 +206,15 @@ def make_deps(
 
 
 class FakeDocumentRepository:
-    def __init__(self, org_id: UUID | None = None) -> None:
+    def __init__(
+        self, org_id: UUID | None = None, uploaders: list[User] | None = None
+    ) -> None:
         self.org_id = org_id
         self.documents: list[Document] = []
+        # Stands in for the real query's join to `users`. Keyed by user id, as
+        # the join is; a document whose uploader is missing is a test that
+        # forgot to register one, and it fails loudly rather than quietly.
+        self.uploaders: dict[UUID, User] = {u.id: u for u in uploaders or []}
         # Set to make add() blow up, standing in for a constraint or RLS
         # violation surfacing from the flush.
         self.fail_with: Exception | None = None
@@ -288,16 +306,43 @@ class FakeDocumentRepository:
             document_id, step, status=StepStatus.FAILED, ended_at=datetime.now(UTC)
         )
 
-    async def list_recent(self, limit: int, offset: int) -> list[Document]:
-        # Insertion order is the tie-break, standing in for the real query's
-        # `ORDER BY created_at DESC, id DESC`. Without it a fixed FakeClock
-        # would leave every created_at equal and the order arbitrary.
-        newest_first = sorted(
-            enumerate(self.documents),
-            key=lambda pair: (pair[1].created_at, pair[0]),
-            reverse=True,
+    async def list_page(self, limit: int, after: DocumentCursor | None) -> DocumentPage:
+        # Same comparison the SQL uses, on the same key: (created_at, id)
+        # descending, and a strict row-value comparison for the seek. Anything
+        # weaker here and the fake would agree with a repository that is wrong.
+        ordered = sorted(
+            self.documents, key=lambda d: (d.created_at, d.id), reverse=True
         )
-        return [document for _, document in newest_first][offset : offset + limit]
+        if after is not None:
+            ordered = [
+                d
+                for d in ordered
+                if (d.created_at, d.id) < (after.created_at, after.id)
+            ]
+
+        rows = ordered[: limit + 1]
+        page = rows[:limit]
+        last = page[-1] if len(rows) > limit else None
+        return DocumentPage(
+            items=[self._summarize(document) for document in page],
+            next_cursor=(
+                DocumentCursor(created_at=last.created_at, id=last.id)
+                if last is not None
+                else None
+            ),
+        )
+
+    def _summarize(self, document: Document) -> DocumentSummary:
+        uploader = self.uploaders[document.uploaded_by]
+        return DocumentSummary(
+            id=document.id,
+            filename=document.filename,
+            status=document.status,
+            created_at=document.created_at,
+            uploader_id=uploader.id,
+            uploader_name=uploader.full_name,
+            uploader_email=uploader.email,
+        )
 
 
 class InMemoryObjectStore:
@@ -380,8 +425,9 @@ class FakeDocumentTransaction:
 def make_upload_deps(
     org_id: UUID,
     max_bytes: int = 1024,
+    uploaders: list[User] | None = None,
 ) -> tuple[UploadDeps, FakeDocumentRepository, InMemoryObjectStore]:
-    documents = FakeDocumentRepository(org_id)
+    documents = FakeDocumentRepository(org_id, uploaders)
     store = InMemoryObjectStore()
     uow = RecordingUnitOfWork()
     deps = UploadDeps(
@@ -390,7 +436,7 @@ def make_upload_deps(
         # The real detector, not a fake: sniffing is the behaviour under test in
         # several of these, and stubbing it would only assert the wiring.
         detector=PureMagicDetector(),
-        clock=FakeClock(),
+        clock=FakeClock(tick=timedelta(seconds=1)),
         max_bytes=max_bytes,
         uow=uow,
         pipeline=FakePipelineRunner(uow=uow),

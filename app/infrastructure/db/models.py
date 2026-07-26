@@ -122,7 +122,13 @@ class DocumentRow(Base):
     failed_step: Mapped[str | None] = mapped_column(String(32))
 
     # Serves the only list query there is: one org's documents, newest first.
-    __table_args__ = (Index("ix_documents_org_id_created_at", "org_id", "created_at"),)
+    # `id` is the third column because it is half of the keyset cursor — with
+    # only (org_id, created_at) the seek predicate on (created_at, id) has to
+    # recheck ties against the heap. Ascending is fine for a DESC listing;
+    # Postgres scans a btree backwards.
+    __table_args__ = (
+        Index("ix_documents_org_id_created_at_id", "org_id", "created_at", "id"),
+    )
 
 
 class DocumentStepRow(Base):

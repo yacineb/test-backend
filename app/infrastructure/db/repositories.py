@@ -13,15 +13,18 @@ from collections.abc import Sequence
 from datetime import datetime
 from uuid import UUID
 
-from sqlalchemy import func, select, update
+from sqlalchemy import Row, func, select, tuple_, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.domain.auth import RefreshToken
 from app.domain.document import (
     STEPS,
     Document,
+    DocumentCursor,
+    DocumentPage,
     DocumentStatus,
     DocumentStep,
+    DocumentSummary,
     Step,
     StepStatus,
 )
@@ -80,6 +83,18 @@ def _to_document(row: DocumentRow, steps: Sequence[DocumentStepRow] = ()) -> Doc
         partner_job_id=row.partner_job_id,
         failed_step=Step(row.failed_step) if row.failed_step else None,
         steps=tuple(sorted((_to_step(s) for s in steps), key=lambda s: order[s.step])),
+    )
+
+
+def _to_summary(row: Row) -> DocumentSummary:
+    return DocumentSummary(
+        id=row.id,
+        filename=row.filename,
+        status=DocumentStatus(row.status),
+        created_at=row.created_at,
+        uploader_id=row.uploader_id,
+        uploader_name=row.uploader_name,
+        uploader_email=row.uploader_email,
     )
 
 
@@ -245,15 +260,54 @@ class OrgScopedDocumentRepository:
         # teardown, long after the handler could compensate for a failure.
         await self._session.flush()
 
-    async def list_recent(self, limit: int, offset: int) -> list[Document]:
-        rows = await self._session.scalars(
-            select(DocumentRow)
-            .where(DocumentRow.org_id == self._org_id)
+    async def list_page(self, limit: int, after: DocumentCursor | None) -> DocumentPage:
+        """Keyset page over (created_at DESC, id DESC).
+
+        The join is inner, and safe as one: `uploaded_by` is a NOT NULL foreign
+        key to `users`, and it is only ever written from the same access token
+        that supplies `org_id`, so the uploader is always a visible row of the
+        caller's own organization. If that ever stops holding, this drops
+        documents rather than showing them with a blank uploader — which is why
+        the org predicate below is on both sides and not left to RLS alone.
+        """
+        query = (
+            select(
+                DocumentRow.id,
+                DocumentRow.filename,
+                DocumentRow.status,
+                DocumentRow.created_at,
+                UserRow.id.label("uploader_id"),
+                UserRow.full_name.label("uploader_name"),
+                UserRow.email.label("uploader_email"),
+            )
+            .join(UserRow, UserRow.id == DocumentRow.uploaded_by)
+            .where(DocumentRow.org_id == self._org_id, UserRow.org_id == self._org_id)
             .order_by(DocumentRow.created_at.desc(), DocumentRow.id.desc())
-            .limit(limit)
-            .offset(offset)
+            # One more than asked for: if it comes back, there is a next page.
+            # Cheaper and more honest than a COUNT(*) over the whole table,
+            # which is the other way to answer "is there more".
+            .limit(limit + 1)
         )
-        return [_to_document(row) for row in rows]
+        if after is not None:
+            # Row-value comparison, not `created_at < x OR (created_at = x AND
+            # id < y)`. Postgres drives an index scan straight from it, and it
+            # is one expression rather than a disjunction to get subtly wrong.
+            query = query.where(
+                tuple_(DocumentRow.created_at, DocumentRow.id)
+                < (after.created_at, after.id)
+            )
+
+        rows = (await self._session.execute(query)).all()
+        page = rows[:limit]
+        last = page[-1] if len(rows) > limit else None
+        return DocumentPage(
+            items=[_to_summary(row) for row in page],
+            next_cursor=(
+                DocumentCursor(created_at=last.created_at, id=last.id)
+                if last is not None
+                else None
+            ),
+        )
 
     # --- pipeline ---------------------------------------------------------
     # Written by the API on upload, and by pipeline workers thereafter. Workers

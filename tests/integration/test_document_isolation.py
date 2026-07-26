@@ -88,9 +88,10 @@ async def test_repository_returns_only_its_own_org(database, two_tenants):
     await _store(database, globex, bob, "globex.pdf")
 
     async with database.tenant_session(acme) as session:
-        found = await OrgScopedDocumentRepository(session, acme).list_recent(50, 0)
+        page = await OrgScopedDocumentRepository(session, acme).list_page(50, None)
 
-    assert [d.filename for d in found] == ["acme.pdf"]
+    assert [d.filename for d in page.items] == ["acme.pdf"]
+    assert page.next_cursor is None
 
 
 async def test_unfiltered_query_cannot_see_the_other_org(database, two_tenants):

@@ -11,7 +11,7 @@ from typing import Protocol
 from uuid import UUID
 
 from app.domain.auth import AuthContext, RefreshToken
-from app.domain.document import Document, Step
+from app.domain.document import Document, DocumentCursor, DocumentPage, Step
 from app.domain.organization import Organization
 from app.domain.partner import PartnerNotification
 from app.domain.user import User
@@ -106,8 +106,16 @@ class DocumentRepository(Protocol):
         """With its pipeline steps attached."""
         ...
 
-    async def list_recent(self, limit: int, offset: int) -> list[Document]:
-        """Newest first, already scoped to one organization by the adapter."""
+    async def list_page(self, limit: int, after: DocumentCursor | None) -> DocumentPage:
+        """One page of summaries, newest first, scoped to one org by the adapter.
+
+        `after` is a position, not a row count: the page starts at the first
+        document strictly older than it. Passing None starts at the newest.
+
+        Summaries, not `Document`s: the per-step pipeline rows `get` attaches
+        are a detail-view concern, and loading them per listed row would be the
+        N+1 this query exists to avoid.
+        """
         ...
 
     # --- pipeline projection ---------------------------------------------

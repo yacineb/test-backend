@@ -89,3 +89,49 @@ class Document:
     @property
     def is_terminal(self) -> bool:
         return self.status in (DocumentStatus.READY, DocumentStatus.FAILED)
+
+
+@dataclass(frozen=True, slots=True)
+class DocumentCursor:
+    """A position in the listing, which is exactly its sort key.
+
+    `created_at` alone is not a position: two documents can share a timestamp,
+    and a cursor that cannot separate them either skips rows or repeats them.
+    `id` breaks the tie, and the pair is unique because `id` is the primary key.
+    """
+
+    created_at: datetime
+    id: UUID
+
+
+@dataclass(frozen=True, slots=True)
+class DocumentSummary:
+    """The listing row: what a document index shows, and nothing else.
+
+    Not a `Document`. The uploader's name and email live on `users`; the
+    bytes-level fields (`sha256`, `storage_key`, `content_type`, `size_bytes`)
+    are not on this screen; and neither are the per-step pipeline rows, which
+    are a detail view's concern. `status` is the pipeline's summary of itself,
+    and it is the one pipeline field a list needs.
+    """
+
+    id: UUID
+    filename: str
+    status: DocumentStatus
+    created_at: datetime
+    uploader_id: UUID
+    uploader_name: str
+    uploader_email: str
+
+
+@dataclass(frozen=True, slots=True)
+class DocumentPage:
+    """One page, and where the next one starts.
+
+    `next_cursor` is None only when the page is the last one — it is derived
+    from a row that was actually fetched, so following it never lands on an
+    empty page.
+    """
+
+    items: list[DocumentSummary]
+    next_cursor: DocumentCursor | None

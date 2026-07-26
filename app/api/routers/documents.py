@@ -4,15 +4,23 @@ from uuid import UUID
 
 from fastapi import APIRouter, File, Query, UploadFile, status
 
+from app.api.cursors import CursorDep, encode_cursor
 from app.api.deps import (
     CurrentUser,
     DocumentRepositoryDep,
     SettingsDep,
     UploadDepsDep,
 )
-from app.api.schemas import DocumentDetailResponse, DocumentResponse, to_detail
+from app.api.schemas import (
+    DocumentDetailResponse,
+    DocumentPageResponse,
+    DocumentResponse,
+    DocumentSummaryResponse,
+    UploaderResponse,
+    to_detail,
+)
 from app.application.upload_document import upload_document
-from app.domain.document import Document
+from app.domain.document import Document, DocumentSummary
 from app.domain.errors import DocumentNotFound
 
 router = APIRouter(prefix="/documents", tags=["documents"])
@@ -28,6 +36,20 @@ def _to_response(document: Document) -> DocumentResponse:
         status=document.status.value,
         uploaded_by=document.uploaded_by,
         created_at=document.created_at,
+    )
+
+
+def _to_summary_response(summary: DocumentSummary) -> DocumentSummaryResponse:
+    return DocumentSummaryResponse(
+        id=summary.id,
+        filename=summary.filename,
+        status=summary.status.value,
+        uploaded_by=UploaderResponse(
+            id=summary.uploader_id,
+            full_name=summary.uploader_name,
+            email=summary.uploader_email,
+        ),
+        created_at=summary.created_at,
     )
 
 
@@ -76,20 +98,30 @@ async def upload(
 
 @router.get(
     "",
-    summary="List the calling organization's documents",
+    summary="List the calling organization's documents, newest first",
     description=(
         "Scoped to the org_id in the bearer token, through an RLS-scoped "
-        "session. There is no parameter that widens the scope."
+        "session. There is no parameter that widens the scope.\n\n"
+        "Paging is by cursor, not offset: pass the `next_cursor` from the "
+        "previous response back as `cursor`, and stop when it comes back null. "
+        "An offset would have to count past every row it skips, and would drop "
+        "or duplicate rows whenever a document is uploaded mid-scroll."
     ),
+    responses={400: {"description": "The cursor is not one we issued"}},
 )
 async def list_documents(
     ctx: CurrentUser,
     documents: DocumentRepositoryDep,
+    after: CursorDep,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
-    offset: Annotated[int, Query(ge=0)] = 0,
-) -> list[DocumentResponse]:
-    found = await documents.list_recent(limit=limit, offset=offset)
-    return [_to_response(document) for document in found]
+) -> DocumentPageResponse:
+    page = await documents.list_page(limit=limit, after=after)
+    return DocumentPageResponse(
+        items=[_to_summary_response(summary) for summary in page.items],
+        next_cursor=(
+            encode_cursor(page.next_cursor) if page.next_cursor is not None else None
+        ),
+    )
 
 
 @router.get(
