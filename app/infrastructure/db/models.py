@@ -9,6 +9,7 @@ from datetime import datetime
 from uuid import UUID, uuid4
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     DateTime,
     ForeignKey,
@@ -84,3 +85,31 @@ class RefreshTokenRow(Base):
         Index("ix_refresh_tokens_family_id", "family_id"),
         Index("ix_refresh_tokens_user_id", "user_id"),
     )
+
+
+class DocumentRow(Base):
+    __tablename__ = "documents"
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    org_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False
+    )
+    # No ondelete: documents outlive the person who uploaded them, so removing
+    # a user who still has documents should fail loudly rather than silently
+    # destroy org records. There is no user-deletion path yet; this makes the
+    # decision explicit when one arrives.
+    uploaded_by: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("users.id"), nullable=False
+    )
+    filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    content_type: Mapped[str] = mapped_column(String(255), nullable=False)
+    size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    storage_key: Mapped[str] = mapped_column(String(512), nullable=False, unique=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    # Serves the only list query there is: one org's documents, newest first.
+    __table_args__ = (Index("ix_documents_org_id_created_at", "org_id", "created_at"),)

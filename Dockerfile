@@ -21,6 +21,11 @@ COPY app ./app
 COPY alembic.ini ./alembic.ini
 COPY migrations ./migrations
 
+# The upload directory has to exist in the image with the right ownership:
+# Docker seeds a fresh named volume from the image path, ownership included,
+# and the runtime stage has no shell to chown it afterwards.
+RUN mkdir -p /data/uploads
+
 # Lean and secure runtime stage: distroless, no shell and no package manager.
 FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
 
@@ -31,6 +36,7 @@ COPY --from=builder /src/app /app/app
 # that matches this build.
 COPY --from=builder /src/alembic.ini /app/alembic.ini
 COPY --from=builder /src/migrations /app/migrations
+COPY --from=builder --chown=65532:65532 /data /data
 
 WORKDIR /app
 

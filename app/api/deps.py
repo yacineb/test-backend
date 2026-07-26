@@ -15,11 +15,14 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.application.deps import AuthDeps, WebhookDeps
+from app.application.upload_document import UploadDeps
 from app.config import Settings, get_settings
 from app.domain.auth import AuthContext
 from app.domain.errors import InvalidAccessToken
+from app.domain.ports import ObjectStore
 from app.infrastructure.clock import SystemClock
 from app.infrastructure.db.repositories import (
+    OrgScopedDocumentRepository,
     OrgScopedOrganizationRepository,
     OrgScopedUserRepository,
     SqlAlchemyUnitOfWork,
@@ -187,3 +190,37 @@ def get_webhook_deps(settings: SettingsDep) -> WebhookDeps:
 
 
 WebhookDepsDep = Annotated[WebhookDeps, Depends(get_webhook_deps)]
+
+
+def get_object_store(request: Request) -> ObjectStore:
+    return request.app.state.object_store
+
+
+ObjectStoreDep = Annotated[ObjectStore, Depends(get_object_store)]
+
+
+def get_document_repository(
+    session: TenantSessionDep, ctx: CurrentUser
+) -> OrgScopedDocumentRepository:
+    return OrgScopedDocumentRepository(session, ctx.org_id)
+
+
+DocumentRepositoryDep = Annotated[
+    OrgScopedDocumentRepository, Depends(get_document_repository)
+]
+
+
+def get_upload_deps(
+    documents: DocumentRepositoryDep,
+    store: ObjectStoreDep,
+    settings: SettingsDep,
+) -> UploadDeps:
+    return UploadDeps(
+        documents=documents,
+        store=store,
+        clock=SystemClock(),
+        max_bytes=settings.storage.max_upload_bytes,
+    )
+
+
+UploadDepsDep = Annotated[UploadDeps, Depends(get_upload_deps)]

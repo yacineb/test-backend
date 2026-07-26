@@ -4,15 +4,21 @@ from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
 
 from app.domain.errors import (
+    EmptyUpload,
     InactiveUser,
     InvalidAccessToken,
     InvalidCredentials,
     InvalidRefreshToken,
+    MissingFilename,
     RefreshTokenReused,
     StaleWebhook,
     UnknownPartnerJob,
+    UploadTooLarge,
 )
 
+# ObjectNotFound is deliberately absent: no route reads from the object store
+# yet, so a mapping for it could never fire. It arrives with the download
+# endpoint that needs it.
 _STATUS_BY_ERROR = {
     InvalidCredentials: status.HTTP_401_UNAUTHORIZED,
     InvalidAccessToken: status.HTTP_401_UNAUTHORIZED,
@@ -23,6 +29,9 @@ _STATUS_BY_ERROR = {
     # signed, and an unknown job_id is one we never issued.
     StaleWebhook: status.HTTP_400_BAD_REQUEST,
     UnknownPartnerJob: status.HTTP_404_NOT_FOUND,
+    UploadTooLarge: status.HTTP_413_CONTENT_TOO_LARGE,
+    EmptyUpload: status.HTTP_400_BAD_REQUEST,
+    MissingFilename: status.HTTP_400_BAD_REQUEST,
 }
 
 

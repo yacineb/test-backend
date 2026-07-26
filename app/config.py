@@ -13,6 +13,7 @@ instead of turning it into DB_URL.
 
 from datetime import timedelta
 from functools import lru_cache
+from pathlib import Path
 
 from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -113,12 +114,41 @@ class PartnerWebhookSettings(BaseSettings):
         return timedelta(seconds=self.tolerance_seconds)
 
 
+class StorageSettings(BaseSettings):
+    """Where document content goes, and how large it may be.
+
+    `max_upload_bytes` is configuration rather than a constant so the size
+    boundary is testable exactly: tests set it to a few hundred bytes and assert
+    that limit and limit+1 land on either side, instead of pushing 100MB through
+    a test client or never testing the comparison at all.
+    """
+
+    model_config = _ENV
+
+    root: Path = Field(default=Path("/data/uploads"), validation_alias="STORAGE_ROOT")
+
+    max_upload_bytes: int = Field(
+        default=100 * 1024 * 1024, validation_alias="MAX_UPLOAD_BYTES"
+    )
+    # Multipart boundaries and part headers travel in the request body but are
+    # not part of the file, so the request-level guard sits above the file limit.
+    body_overhead_bytes: int = Field(
+        default=1024 * 1024, validation_alias="MAX_BODY_OVERHEAD_BYTES"
+    )
+    chunk_bytes: int = Field(default=1024 * 1024, validation_alias="UPLOAD_CHUNK_BYTES")
+
+    @property
+    def max_body_bytes(self) -> int:
+        return self.max_upload_bytes + self.body_overhead_bytes
+
+
 class Settings(BaseSettings):
     model_config = _ENV
 
     db: DatabaseSettings = Field(default_factory=DatabaseSettings)
     jwt: JwtSettings = Field(default_factory=JwtSettings)
     partner: PartnerWebhookSettings = Field(default_factory=PartnerWebhookSettings)
+    storage: StorageSettings = Field(default_factory=StorageSettings)
 
     # Password given to every seeded user. Local convenience only, and it
     # belongs to neither section above.

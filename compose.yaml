@@ -8,6 +8,7 @@ x-app-env: &app-env
   MIGRATION_DATABASE_URL: postgresql+asyncpg://postgres:postgres@db:5432/appdb
   APP_RW_PASSWORD: app_rw
   APP_AUTH_PASSWORD: app_auth
+  STORAGE_ROOT: /data/uploads
   JWT_SECRET: dev-only-secret-change-me-in-production
   JWT_ACCESS_TTL_SECONDS: "21600" # 6h
   JWT_REFRESH_TTL_SECONDS: "2592000" # 30d
@@ -60,6 +61,8 @@ services:
     ports:
       - "8000:8000"
     environment: *app-env
+    volumes:
+      - uploads:/data/uploads
     depends_on:
       seed:
         condition: service_completed_successfully
@@ -78,3 +81,4 @@ services:
 
 volumes:
   pgdata:
+  uploads:

@@ -6,13 +6,16 @@ are *not* modelled here — commit() is a counter. Anything that depends on real
 rollback behaviour belongs in tests/integration.
 """
 
+from collections.abc import AsyncIterator
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
 from app.application.deps import AuthDeps
+from app.application.upload_document import UploadDeps
 from app.domain.auth import RefreshToken
-from app.domain.errors import UnknownPartnerJob
+from app.domain.document import Document
+from app.domain.errors import ObjectNotFound, UnknownPartnerJob
 from app.domain.organization import Organization
 from app.domain.partner import PartnerNotification
 from app.domain.user import User
@@ -115,6 +118,12 @@ class RejectingPartnerJobSink:
         raise UnknownPartnerJob(f"no document waiting on {notification.job_id}")
 
 
+async def chunks(*parts: bytes) -> AsyncIterator[bytes]:
+    """Feed fixed byte parts to anything consuming an upload stream."""
+    for part in parts:
+        yield part
+
+
 def make_token_service() -> PyJwtTokenService:
     return PyJwtTokenService(
         secret="test-secret-at-least-32-bytes-long!!",
@@ -158,3 +167,70 @@ def make_deps(
         refresh_ttl=refresh_ttl,
     )
     return deps, refresh_tokens, uow
+
+
+class FakeDocumentRepository:
+    def __init__(self, org_id: UUID | None = None) -> None:
+        self.org_id = org_id
+        self.documents: list[Document] = []
+        # Set to make add() blow up, standing in for a constraint or RLS
+        # violation surfacing from the flush.
+        self.fail_with: Exception | None = None
+
+    async def add(self, document: Document) -> None:
+        if self.fail_with is not None:
+            raise self.fail_with
+        self.documents.append(document)
+
+    async def list_recent(self, limit: int, offset: int) -> list[Document]:
+        # Insertion order is the tie-break, standing in for the real query's
+        # `ORDER BY created_at DESC, id DESC`. Without it a fixed FakeClock
+        # would leave every created_at equal and the order arbitrary.
+        newest_first = sorted(
+            enumerate(self.documents),
+            key=lambda pair: (pair[1].created_at, pair[0]),
+            reverse=True,
+        )
+        return [document for _, document in newest_first][offset : offset + limit]
+
+
+class InMemoryObjectStore:
+    """Honours the ObjectStore contract: complete or absent, never partial.
+
+    Chunks are accumulated and only published under the key once the iterator
+    finishes, so a raising stream leaves nothing behind — the same observable
+    behaviour the POSIX adapter gets from write-then-rename.
+    """
+
+    def __init__(self) -> None:
+        self.objects: dict[str, bytes] = {}
+
+    async def put(self, key: str, chunks) -> int:
+        buffer = bytearray()
+        async for chunk in chunks:
+            buffer.extend(chunk)
+        self.objects[key] = bytes(buffer)
+        return len(buffer)
+
+    async def get(self, key: str):
+        if key not in self.objects:
+            raise ObjectNotFound(key)
+        yield self.objects[key]
+
+    async def delete(self, key: str) -> None:
+        self.objects.pop(key, None)
+
+
+def make_upload_deps(
+    org_id: UUID,
+    max_bytes: int = 1024,
+) -> tuple[UploadDeps, FakeDocumentRepository, InMemoryObjectStore]:
+    documents = FakeDocumentRepository(org_id)
+    store = InMemoryObjectStore()
+    deps = UploadDeps(
+        documents=documents,
+        store=store,
+        clock=FakeClock(),
+        max_bytes=max_bytes,
+    )
+    return deps, documents, store

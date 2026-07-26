@@ -1,3 +1,4 @@
+from datetime import datetime
 from typing import Any
 from uuid import UUID
 
@@ -20,6 +21,23 @@ class TokenResponse(BaseModel):
     refresh_token: str
     token_type: str = "bearer"
     expires_in: int
+
+
+class DocumentResponse(BaseModel):
+    """Public view of a document.
+
+    `storage_key` is deliberately absent: it is an internal addressing detail,
+    and returning it invites clients to depend on the layout.
+    """
+
+    id: UUID
+    filename: str
+    content_type: str
+    size_bytes: int
+    sha256: str
+    status: str
+    uploaded_by: UUID
+    created_at: datetime
 
 
 class MeResponse(BaseModel):

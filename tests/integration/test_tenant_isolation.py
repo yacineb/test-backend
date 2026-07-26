@@ -15,17 +15,9 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 from app.infrastructure.db.models import OrganizationRow, UserRow
 from app.infrastructure.db.repositories import OrgScopedUserRepository
-from app.infrastructure.db.session import Database
 from tests.integration.conftest import requires_postgres
 
 pytestmark = [pytest.mark.anyio, requires_postgres]
-
-
-@pytest.fixture
-async def database(settings):
-    db = Database(settings)
-    yield db
-    await db.dispose()
 
 
 @pytest.fixture

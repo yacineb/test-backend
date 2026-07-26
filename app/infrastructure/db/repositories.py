@@ -16,9 +16,15 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.domain.auth import RefreshToken
+from app.domain.document import Document, DocumentStatus
 from app.domain.organization import Organization
 from app.domain.user import User
-from app.infrastructure.db.models import OrganizationRow, RefreshTokenRow, UserRow
+from app.infrastructure.db.models import (
+    DocumentRow,
+    OrganizationRow,
+    RefreshTokenRow,
+    UserRow,
+)
 
 
 def _to_user(row: UserRow) -> User:
@@ -34,6 +40,21 @@ def _to_user(row: UserRow) -> User:
 
 def _to_organization(row: OrganizationRow) -> Organization:
     return Organization(id=row.id, name=row.name, slug=row.slug)
+
+
+def _to_document(row: DocumentRow) -> Document:
+    return Document(
+        id=row.id,
+        org_id=row.org_id,
+        uploaded_by=row.uploaded_by,
+        filename=row.filename,
+        content_type=row.content_type,
+        size_bytes=row.size_bytes,
+        sha256=row.sha256,
+        storage_key=row.storage_key,
+        status=DocumentStatus(row.status),
+        created_at=row.created_at,
+    )
 
 
 def _to_refresh_token(row: RefreshTokenRow) -> RefreshToken:
@@ -154,3 +175,43 @@ class UnscopedRefreshTokenRepository:
             )
             .values(revoked_at=now)
         )
+
+
+class OrgScopedDocumentRepository:
+    def __init__(self, session: AsyncSession, org_id: UUID) -> None:
+        self._session = session
+        self._org_id = org_id
+
+    async def add(self, document: Document) -> None:
+        if document.org_id != self._org_id:
+            # RLS would refuse this too, but that surfaces as an opaque database
+            # error. A caller reaching here has a wiring bug, not a bad request.
+            raise ValueError("document does not belong to this repository's org")
+
+        self._session.add(
+            DocumentRow(
+                id=document.id,
+                org_id=document.org_id,
+                uploaded_by=document.uploaded_by,
+                filename=document.filename,
+                content_type=document.content_type,
+                size_bytes=document.size_bytes,
+                sha256=document.sha256,
+                storage_key=document.storage_key,
+                status=document.status.value,
+                created_at=document.created_at,
+            )
+        )
+        # Flush rather than leave it pending: the request transaction commits at
+        # teardown, long after the handler could compensate for a failure.
+        await self._session.flush()
+
+    async def list_recent(self, limit: int, offset: int) -> list[Document]:
+        rows = await self._session.scalars(
+            select(DocumentRow)
+            .where(DocumentRow.org_id == self._org_id)
+            .order_by(DocumentRow.created_at.desc(), DocumentRow.id.desc())
+            .limit(limit)
+            .offset(offset)
+        )
+        return [_to_document(row) for row in rows]

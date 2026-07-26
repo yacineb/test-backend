@@ -4,11 +4,13 @@ Protocols, not ABCs: adapters satisfy them structurally, so infrastructure
 never imports the domain to inherit from it, and tests can hand-roll fakes.
 """
 
+from collections.abc import AsyncIterator
 from datetime import datetime
 from typing import Protocol
 from uuid import UUID
 
 from app.domain.auth import AuthContext, RefreshToken
+from app.domain.document import Document
 from app.domain.organization import Organization
 from app.domain.partner import PartnerNotification
 from app.domain.user import User
@@ -82,4 +84,43 @@ class PartnerJobSink(Protocol):
         idempotent: partners retry, so the same job_id will arrive twice and a
         duplicate must not apply the outcome twice.
         """
+
+
+class DocumentRepository(Protocol):
+    async def add(self, document: Document) -> None:
+        """Persist a document and flush, so violations surface to the caller."""
+        ...
+
+    async def list_recent(self, limit: int, offset: int) -> list[Document]:
+        """Newest first, already scoped to one organization by the adapter."""
+        ...
+
+
+class ObjectStore(Protocol):
+    """Blob storage for document content.
+
+    The contract every backend must honour:
+
+        A key either exists complete, or does not exist. There is no partial
+        object, under any failure.
+
+    That is why `put` owns the whole write/commit/abort lifecycle instead of
+    handing back a writer: on POSIX the commit is an atomic rename, on S3 it is
+    CompleteMultipartUpload, and neither can be driven correctly by a caller
+    holding a file handle.
+    """
+
+    async def put(self, key: str, chunks: AsyncIterator[bytes]) -> int:
+        """Consume `chunks` and commit them at `key`. Returns bytes written.
+
+        If `chunks` raises, nothing is committed and no debris is left behind.
+        """
+        ...
+
+    def get(self, key: str) -> AsyncIterator[bytes]:
+        """Stream the object at `key`, or raise `ObjectNotFound`."""
+        ...
+
+    async def delete(self, key: str) -> None:
+        """Remove `key`. Idempotent: deleting a missing key is not an error."""
         ...

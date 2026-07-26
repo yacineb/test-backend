@@ -109,13 +109,13 @@ relative to `pyproject.toml`. Commit both together.
 
 ```
 app/domain/          entities, ports (Protocols), errors — no I/O, no framework
-app/application/     use cases: login, refresh, logout
-app/infrastructure/  SQLAlchemy, argon2, PyJWT — the adapters
-app/api/             FastAPI routers, dependencies, error mapping
+app/application/     use cases: login, refresh, logout, upload_document
+app/infrastructure/  SQLAlchemy, argon2, PyJWT, POSIX object store — the adapters
+app/api/             FastAPI routers, dependencies, error mapping, body-size guard
 app/config.py        settings, all env-driven
 app/seed.py          idempotent development seed
 app/main.py          app factory and the /health endpoint
-migrations/          Alembic; 0001 creates the schema, roles and RLS policies
+migrations/          Alembic; 0001 schema, roles and RLS policies; 0002 documents
 tests/unit/          use cases against in-memory fakes
 tests/api/           routes with the adapters overridden
 tests/integration/   real Postgres; proves RLS. Skipped without TEST_POSTGRES_DSN
@@ -127,6 +127,25 @@ pyproject.toml       deps, ruff and pytest config
 Dependencies point inward only: `domain` imports nothing but the standard
 library, `application` imports `domain`, `infrastructure` implements the
 domain's ports, and `api` wires them together.
+
+## Document uploads
+
+`POST /documents` streams a multipart upload into an `ObjectStore` and records a
+row; `GET /documents` lists the caller's organization. Both take the organization
+and the uploader from the bearer token — neither is a request parameter.
+
+| variable | default | meaning |
+|---|---|---|
+| `STORAGE_ROOT` | `/data/uploads` | where the POSIX backend writes; a compose volume |
+| `MAX_UPLOAD_BYTES` | `104857600` | per-file limit, 100 MiB |
+| `MAX_BODY_OVERHEAD_BYTES` | `1048576` | slack above it for multipart framing |
+| `UPLOAD_CHUNK_BYTES` | `1048576` | read/write chunk size |
+
+For a host-side run, point `STORAGE_ROOT` somewhere writable (`STORAGE_ROOT=./var/uploads`).
+
+The rationale — the storage port's atomicity contract, why the size limit is
+enforced in two places, and when to move to presigned S3 uploads — is in
+[docs/upload-architecture.md](docs/upload-architecture.md).
 
 `[tool.uv] package = false` — this is an application, not a library, so nothing
 is built or installed as a package. `pytest` finds `app/` via

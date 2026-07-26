@@ -46,3 +46,32 @@ class StaleWebhook(WebhookError):
 
 class UnknownPartnerJob(WebhookError):
     """No document is waiting on that job_id."""
+
+
+class UploadError(DomainError):
+    """An upload was rejected before it became a document."""
+
+
+class UploadTooLarge(UploadError):
+    """The file exceeds the configured per-upload limit."""
+
+    def __init__(self, limit: int) -> None:
+        super().__init__(f"file exceeds the {limit} byte limit")
+
+
+class EmptyUpload(UploadError):
+    """A file part was present but carried no bytes."""
+
+    def __init__(self) -> None:
+        super().__init__("file is empty")
+
+
+class MissingFilename(UploadError):
+    """A file part arrived without a name to record it under."""
+
+    def __init__(self) -> None:
+        super().__init__("file must have a filename")
+
+
+class ObjectNotFound(DomainError):
+    """Read of a storage key that does not exist."""

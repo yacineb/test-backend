@@ -21,6 +21,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from app.config import Settings, get_settings
+from app.infrastructure.db.session import Database
 
 DSN = os.environ.get("TEST_POSTGRES_DSN")
 
@@ -43,6 +44,14 @@ async def _reset_schema() -> None:
         await connection.execute(text("DROP SCHEMA IF EXISTS public CASCADE"))
         await connection.execute(text("CREATE SCHEMA public"))
     await engine.dispose()
+
+
+@pytest.fixture
+async def database(settings: Settings):
+    """A Database bound to the throwaway Postgres, disposed after each test."""
+    db = Database(settings)
+    yield db
+    await db.dispose()
 
 
 @pytest.fixture(scope="session")
