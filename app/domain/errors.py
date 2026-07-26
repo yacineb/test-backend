@@ -73,6 +73,16 @@ class MissingFilename(UploadError):
         super().__init__("file must have a filename")
 
 
+class UnsupportedFileType(UploadError):
+    """The bytes are not a PDF, whatever the client's Content-Type claimed."""
+
+    def __init__(self, detected: str | None) -> None:
+        super().__init__(
+            f"only application/pdf is accepted; the file's contents look like "
+            f"{detected or 'an unrecognised format'}"
+        )
+
+
 class ObjectNotFound(DomainError):
     """Read of a storage key that does not exist."""
 

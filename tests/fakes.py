@@ -27,6 +27,7 @@ from app.domain.errors import ObjectNotFound, UnknownPartnerJob
 from app.domain.organization import Organization
 from app.domain.partner import PartnerNotification
 from app.domain.user import User
+from app.infrastructure.content_type import PureMagicDetector
 from app.infrastructure.security.jwt import PyJwtTokenService
 
 
@@ -130,6 +131,21 @@ async def chunks(*parts: bytes) -> AsyncIterator[bytes]:
     """Feed fixed byte parts to anything consuming an upload stream."""
     for part in parts:
         yield part
+
+
+def pdf_bytes(payload: bytes = b"body", size: int | None = None) -> bytes:
+    """Bytes that sniff as a real PDF.
+
+    Uploads are content-checked, so test fixtures have to look like the thing
+    they claim to be. `size` pads or truncates to an exact length for the
+    size-limit boundary tests, keeping the magic header intact.
+    """
+    data = b"%PDF-1.7\n" + payload
+    if size is None:
+        return data
+    if size < len(b"%PDF-"):
+        raise ValueError("too short to still be a detectable PDF")
+    return data[:size] if size <= len(data) else data + b"0" * (size - len(data))
 
 
 def make_token_service() -> PyJwtTokenService:
@@ -371,6 +387,9 @@ def make_upload_deps(
     deps = UploadDeps(
         documents=documents,
         store=store,
+        # The real detector, not a fake: sniffing is the behaviour under test in
+        # several of these, and stubbing it would only assert the wiring.
+        detector=PureMagicDetector(),
         clock=FakeClock(),
         max_bytes=max_bytes,
         uow=uow,

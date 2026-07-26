@@ -14,6 +14,7 @@ from app.domain.errors import (
     RefreshTokenReused,
     StaleWebhook,
     UnknownPartnerJob,
+    UnsupportedFileType,
     UploadTooLarge,
 )
 
@@ -36,6 +37,7 @@ _STATUS_BY_ERROR = {
     UploadTooLarge: status.HTTP_413_CONTENT_TOO_LARGE,
     EmptyUpload: status.HTTP_400_BAD_REQUEST,
     MissingFilename: status.HTTP_400_BAD_REQUEST,
+    UnsupportedFileType: status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
 }
 
 

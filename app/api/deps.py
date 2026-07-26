@@ -21,6 +21,7 @@ from app.domain.auth import AuthContext
 from app.domain.errors import InvalidAccessToken
 from app.domain.ports import ObjectStore
 from app.infrastructure.clock import SystemClock
+from app.infrastructure.content_type import PureMagicDetector
 from app.infrastructure.db.repositories import (
     OrgScopedDocumentRepository,
     OrgScopedOrganizationRepository,
@@ -233,6 +234,7 @@ def get_upload_deps(
     return UploadDeps(
         documents=OrgScopedDocumentRepository(session, ctx.org_id),
         store=store,
+        detector=PureMagicDetector(),
         clock=SystemClock(),
         max_bytes=settings.storage.max_upload_bytes,
         uow=TenantUnitOfWork(session, ctx.org_id),

@@ -9,6 +9,7 @@ dependencies = [
     "asyncpg>=0.30",
     "dbos>=2.28.0",
     "fastapi>=0.115",
+    "puremagic>=2.0",
     "pydantic-settings>=2.7",
     "pydantic[email]>=2.10",
     "pyjwt>=2.10",

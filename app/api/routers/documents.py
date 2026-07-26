@@ -48,6 +48,7 @@ async def _iter_upload(upload: UploadFile, chunk_size: int) -> AsyncIterator[byt
     responses={
         400: {"description": "Missing filename, or the file carried no bytes"},
         413: {"description": "File exceeds the configured size limit"},
+        415: {"description": "The file's contents are not a PDF"},
     },
 )
 async def upload(
@@ -62,7 +63,9 @@ async def upload(
         deps,
         ctx,
         filename=file.filename,
-        content_type=file.content_type or "application/octet-stream",
+        # file.content_type is deliberately not forwarded: the use case decides
+        # the type from the bytes, because the client's header is only a claim.
+        #
         # Known up front because the multipart parser buffers the body before
         # the handler runs; see app/api/middleware.py for why that matters.
         declared_size=file.size,

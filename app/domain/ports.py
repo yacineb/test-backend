@@ -87,6 +87,16 @@ class PartnerJobSink(Protocol):
         """
 
 
+class ContentTypeDetector(Protocol):
+    def sniff(self, head: bytes) -> str | None:
+        """The MIME type implied by a file's leading bytes, or None if unknown.
+
+        Takes the head rather than the whole file so the decision can be made
+        before any of it is written to storage.
+        """
+        ...
+
+
 class DocumentRepository(Protocol):
     async def add(self, document: Document) -> None:
         """Persist a document and flush, so violations surface to the caller."""

@@ -15,12 +15,13 @@ from fastapi.testclient import TestClient
 from app.api.deps import get_document_repository, get_token_service, get_upload_deps
 from app.domain.auth import AuthContext
 from app.main import app
-from tests.fakes import make_token_service, make_upload_deps
+from tests.fakes import make_token_service, make_upload_deps, pdf_bytes
 
 ORG = uuid4()
 OTHER_ORG = uuid4()
 USER = uuid4()
 MAX_BYTES = 1024
+PDF = pdf_bytes(b"pdf bytes")
 
 
 @pytest.fixture
@@ -49,7 +50,7 @@ def auth(token: str | None = None) -> dict[str, str]:
     return {"Authorization": f"Bearer {token or token_for()}"}
 
 
-def upload(client: TestClient, content: bytes = b"pdf bytes", **kwargs):
+def upload(client: TestClient, content: bytes = PDF, **kwargs):
     return client.post(
         "/documents",
         headers=kwargs.pop("headers", auth()),
@@ -62,7 +63,7 @@ def test_upload_without_a_token_is_rejected(client, wiring):
     _, documents, store = wiring
 
     response = client.post(
-        "/documents", files={"file": ("report.pdf", b"x", "application/pdf")}
+        "/documents", files={"file": ("report.pdf", PDF, "application/pdf")}
     )
 
     assert response.status_code == 401
@@ -83,7 +84,7 @@ def test_upload_succeeds_with_a_bearer_token(client):
     assert response.status_code == 201, response.text
     body = response.json()
     assert body["filename"] == "report.pdf"
-    assert body["size_bytes"] == 9
+    assert body["size_bytes"] == len(PDF)
     assert body["status"] == "uploaded"
     # Internal addressing detail; clients must not be able to depend on it.
     assert "storage_key" not in body
@@ -115,7 +116,7 @@ def test_org_id_supplied_by_the_client_is_ignored(client, wiring):
     response = client.post(
         "/documents",
         headers=auth(),
-        files={"file": ("report.pdf", b"x", "application/pdf")},
+        files={"file": ("report.pdf", PDF, "application/pdf")},
         data={"org_id": str(OTHER_ORG), "uploaded_by": str(uuid4())},
     )
 
@@ -134,7 +135,7 @@ def test_storage_key_is_org_scoped(client, wiring):
 
 
 def test_exactly_at_the_size_limit_is_accepted(client):
-    response = upload(client, b"x" * MAX_BYTES)
+    response = upload(client, pdf_bytes(size=MAX_BYTES))
 
     assert response.status_code == 201
     assert response.json()["size_bytes"] == MAX_BYTES
@@ -143,7 +144,7 @@ def test_exactly_at_the_size_limit_is_accepted(client):
 def test_one_byte_over_the_size_limit_is_rejected(client, wiring):
     _, documents, store = wiring
 
-    response = upload(client, b"x" * (MAX_BYTES + 1))
+    response = upload(client, pdf_bytes(size=MAX_BYTES + 1))
 
     assert response.status_code == 413
     assert str(MAX_BYTES) in response.json()["detail"]
@@ -157,6 +158,55 @@ def test_empty_file_is_rejected(client):
     assert response.status_code == 400
 
 
+@pytest.mark.parametrize(
+    ("label", "content"),
+    [
+        ("png", b"\x89PNG\r\n\x1a\n" + b"\x00" * 64),
+        ("zip/docx", b"PK\x03\x04" + b"\x00" * 64),
+        ("plain text", b"not a pdf at all, no matter what the header says"),
+    ],
+)
+def test_non_pdf_content_is_rejected_with_415(client, wiring, label, content):
+    _, documents, store = wiring
+
+    response = upload(client, content)
+
+    assert response.status_code == 415
+    assert "application/pdf" in response.json()["detail"]
+    assert documents.documents == []
+    assert store.objects == {}
+
+
+def test_a_lying_content_type_header_does_not_get_a_png_accepted(client, wiring):
+    """The client controls the header; it does not control the bytes."""
+    _, documents, store = wiring
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
+
+    response = client.post(
+        "/documents",
+        headers=auth(),
+        files={"file": ("totally-a-report.pdf", png, "application/pdf")},
+    )
+
+    assert response.status_code == 415
+    assert documents.documents == []
+    assert store.objects == {}
+
+
+def test_the_stored_type_is_the_sniffed_one_not_the_declared_one(client, wiring):
+    _, documents, _ = wiring
+
+    body = client.post(
+        "/documents",
+        headers=auth(),
+        # A deliberately wrong but harmless declaration on genuine PDF bytes.
+        files={"file": ("report.pdf", PDF, "application/octet-stream")},
+    ).json()
+
+    assert body["content_type"] == "application/pdf"
+    assert documents.documents[0].content_type == "application/pdf"
+
+
 def test_listing_requires_a_token(client):
     assert client.get("/documents").status_code == 401
 
@@ -166,7 +216,7 @@ def test_listing_returns_the_stored_documents_newest_first(client):
         client.post(
             "/documents",
             headers=auth(),
-            files={"file": (f"{name}.pdf", b"x", "application/pdf")},
+            files={"file": (f"{name}.pdf", PDF, "application/pdf")},
         )
 
     listed = client.get("/documents", headers=auth()).json()

@@ -188,6 +188,12 @@ has returned, so setting it in application code produces two `Server` headers.
 row; `GET /documents` lists the caller's organization. Both take the organization
 and the uploader from the bearer token — neither is a request parameter.
 
+Only PDFs are accepted, decided by sniffing the file's leading bytes with
+`puremagic` — never by the `Content-Type` the client sent, which is a claim
+rather than evidence. A PNG renamed `report.pdf` and declared `application/pdf`
+gets a `415`. The sniffed type is what gets recorded, so a genuine PDF uploaded
+as `application/octet-stream` is stored as `application/pdf`.
+
 | variable | default | meaning |
 |---|---|---|
 | `STORAGE_ROOT` | `/data/uploads` | where the POSIX backend writes; a compose volume |

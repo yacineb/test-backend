@@ -375,10 +375,9 @@ the difference should be visible.
 - **Idempotency.** A retried upload creates a second document. The answer is an
   `Idempotency-Key` header with a uniqueness constraint, not client-side
   deduplication. Not built because no client currently retries automatically.
-- **Content-type enforcement.** Accepts any type and records what was declared.
-  The corpus is PDFs, so an allowlist is defensible — it is absent because
-  nothing in the requirements asks for it, and magic-byte sniffing is a larger
-  commitment than it appears.
+- **Formats other than PDF.** Only `application/pdf` is accepted; see §9. The
+  accepted set is a constant rather than an env var, because which formats the
+  pipeline can process is a product decision, not a per-deployment one.
 - **Deduplication.** `sha256` is recorded, which is the hard part. Whether
   identical bytes uploaded by two orgs share one object is a tenancy and deletion
   question, not a storage one, and it is not answered here.
@@ -416,3 +415,50 @@ curl http://localhost:8000/documents -H "Authorization: Bearer $TOKEN"
 Nothing in either request names an organization. Log in as `bob@globex.example.com`,
 upload there, and list again as Alice: neither sees the other's documents, and
 the only thing that changed was the token.
+
+## 9. Only PDFs, decided by the bytes
+
+The corpus is PDFs, so `application/pdf` is the only accepted type. The check
+runs on the file's leading bytes, never on the `Content-Type` the client sent.
+
+That distinction is the whole point. A request header is a claim made by the
+party we are trying to validate; treating it as evidence means the check can be
+defeated by editing one string. Renaming `payload.png` to `report.pdf` and
+declaring `Content-Type: application/pdf` gets a `415`, because the first eight
+bytes still say PNG.
+
+The use case therefore takes **no `content_type` argument at all**. The router
+does not forward `file.content_type`, so there is no path by which a client's
+claim can reach the decision or the stored row — the sniffed type is what gets
+recorded. A genuine PDF uploaded as `application/octet-stream` is accepted and
+stored as `application/pdf`.
+
+### Rejecting before anything is written
+
+The first 4KB are pulled off the stream, checked, and then replayed ahead of the
+rest, so the decision happens before `ObjectStore.put` is called. A rejected
+upload never opens a temp file, rather than opening one and cleaning it up.
+
+That peek also subsumes the empty-file case: a stream with no head is empty, and
+is known to be empty before any write. The post-write `size == 0` check that
+used to follow the upload is gone, because it became unreachable.
+
+### puremagic, not python-magic
+
+`python-magic` binds to the system `libmagic` shared object. The runtime image is
+distroless — no shell, no package manager — so that library would have to be
+vendored in by hand and kept in step with the base image. `puremagic` is pure
+Python with no dependencies and needs nothing from the image.
+
+The detector sits behind a `ContentTypeDetector` port with the adapter in
+`app/infrastructure/`, matching how every other third-party dependency is
+handled here (`argon2` behind `PasswordHasher`, `PyJWT` behind `TokenService`),
+so the application layer keeps importing nothing but the standard library.
+
+### What this check is and is not
+
+It verifies the file *starts* like a PDF. It is not a parser and does not prove
+the document is well-formed, non-malicious, or renderable — a PDF header glued
+to arbitrary bytes passes. Real validation belongs to the OCR stage, which has
+to parse the file anyway; this check exists to reject obvious mismatches cheaply
+at the boundary rather than to guarantee integrity.

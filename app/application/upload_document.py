@@ -7,26 +7,67 @@ from uuid import uuid4
 
 from app.domain.auth import AuthContext
 from app.domain.document import Document, DocumentStatus
-from app.domain.errors import EmptyUpload, MissingFilename, UploadTooLarge
+from app.domain.errors import (
+    EmptyUpload,
+    MissingFilename,
+    UnsupportedFileType,
+    UploadTooLarge,
+)
 from app.domain.ports import (
     Clock,
+    ContentTypeDetector,
     DocumentRepository,
     ObjectStore,
     PipelineRunner,
     UnitOfWork,
 )
 
+# The corpus is PDFs; nothing else is accepted. A single constant rather than a
+# config knob, because "which formats do we ingest" is a product decision the
+# pipeline downstream depends on, not a per-deployment setting.
+ACCEPTED_MIME = "application/pdf"
+
+# Every magic signature puremagic knows sits far inside this. Held in memory
+# only until the type is decided.
+SNIFF_BYTES = 4096
+
 
 @dataclass(frozen=True, slots=True)
 class UploadDeps:
     documents: DocumentRepository
     store: ObjectStore
+    detector: ContentTypeDetector
     clock: Clock
     max_bytes: int
     # Processing starts as the upload finishes, so the use case that owns "the
     # upload is complete" is also the one that says so.
     uow: UnitOfWork
     pipeline: PipelineRunner
+
+
+async def _split_head(
+    chunks: AsyncIterator[bytes], size: int
+) -> tuple[bytes, AsyncIterator[bytes]]:
+    """Pull the first `size` bytes off a stream without losing them.
+
+    Returns the head, plus an iterator that replays it followed by the rest, so
+    the content check can run before a single byte reaches storage.
+    """
+    head = bytearray()
+    buffered: list[bytes] = []
+    async for chunk in chunks:
+        buffered.append(chunk)
+        head.extend(chunk)
+        if len(head) >= size:
+            break
+
+    async def replayed() -> AsyncIterator[bytes]:
+        for chunk in buffered:
+            yield chunk
+        async for chunk in chunks:
+            yield chunk
+
+    return bytes(head[:size]), replayed()
 
 
 class MeasuredStream:
@@ -60,7 +101,6 @@ async def upload_document(
     ctx: AuthContext,
     *,
     filename: str | None,
-    content_type: str,
     declared_size: int | None,
     chunks: AsyncIterator[bytes],
 ) -> Document:
@@ -77,6 +117,10 @@ async def upload_document(
     bytes that are about to be thrown away. MeasuredStream is the authority
     either way, and is what still holds if the transport ever becomes genuinely
     streamed and the size is unknown up front.
+
+    The file's type is decided by its leading bytes, never by the Content-Type
+    the client sent -- that header is a claim, and the whole point of the check
+    is that the claim may be a lie. The sniffed type is what gets recorded.
     """
     if not filename:
         raise MissingFilename
@@ -87,24 +131,28 @@ async def upload_document(
         if declared_size == 0:
             raise EmptyUpload
 
+    head, body = await _split_head(chunks, SNIFF_BYTES)
+    if not head:
+        raise EmptyUpload
+
+    detected = deps.detector.sniff(head)
+    if detected != ACCEPTED_MIME:
+        raise UnsupportedFileType(detected)
+
     document_id = uuid4()
     # Server-generated. Nothing the client sent appears in this string, and the
     # org prefix is what later carries per-tenant lifecycle rules on S3.
     storage_key = f"{ctx.org_id}/{document_id}"
 
-    stream = MeasuredStream(chunks, deps.max_bytes)
+    stream = MeasuredStream(body, deps.max_bytes)
     await deps.store.put(storage_key, stream)
-
-    if stream.size == 0:
-        await deps.store.delete(storage_key)
-        raise EmptyUpload
 
     document = Document(
         id=document_id,
         org_id=ctx.org_id,
         uploaded_by=ctx.user_id,
         filename=filename,
-        content_type=content_type,
+        content_type=detected,
         size_bytes=stream.size,
         sha256=stream.sha256,
         storage_key=storage_key,
