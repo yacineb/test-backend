@@ -34,6 +34,10 @@ COPY --from=builder /app/.venv /app/.venv
 COPY --from=builder /src/app /app/app
 # Migrations ship with the image so the migrate service runs the exact revision
 # that matches this build.
+# psycopg ships its own libpq and vendors its dependencies, with one
+# exception: it links zlib from the system, and distroless/cc does not
+# carry it. Without this the DBOS system-database driver fails to import.
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libz.so.1 /usr/lib/x86_64-linux-gnu/
 COPY --from=builder /src/alembic.ini /app/alembic.ini
 COPY --from=builder /src/migrations /app/migrations
 COPY --from=builder --chown=65532:65532 /data /data

@@ -1,9 +1,11 @@
+from dataclasses import asdict
 from datetime import datetime
 from typing import Any
 from uuid import UUID
 
 from pydantic import AwareDatetime, BaseModel, EmailStr, Field
 
+from app.domain.document import Document, Step, StepStatus
 from app.domain.partner import PartnerJobStatus
 
 
@@ -72,3 +74,40 @@ class WebhookSignature(BaseModel):
 
     signature: str
     body: str
+
+
+class StepView(BaseModel):
+    """One pipeline step's progress."""
+
+    step: Step
+    status: StepStatus
+    attempts: int
+    last_error: str | None = None
+    output: dict[str, Any] | None = None
+    started_at: datetime | None = None
+    ended_at: datetime | None = None
+
+
+class DocumentDetailResponse(DocumentResponse):
+    """A document plus where its pipeline has got to."""
+
+    # Opaque to the client; it is the key the partner's webhook joins on.
+    partner_job_id: str | None = None
+    failed_step: Step | None = None
+    steps: list[StepView]
+
+
+def to_detail(document: Document) -> DocumentDetailResponse:
+    return DocumentDetailResponse(
+        id=document.id,
+        filename=document.filename,
+        content_type=document.content_type,
+        size_bytes=document.size_bytes,
+        sha256=document.sha256,
+        status=document.status.value,
+        uploaded_by=document.uploaded_by,
+        created_at=document.created_at,
+        partner_job_id=document.partner_job_id,
+        failed_step=document.failed_step,
+        steps=[StepView(**asdict(step)) for step in document.steps],
+    )

@@ -7,6 +7,7 @@ rollback behaviour belongs in tests/integration.
 """
 
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
@@ -14,7 +15,14 @@ from uuid import UUID, uuid4
 from app.application.deps import AuthDeps
 from app.application.upload_document import UploadDeps
 from app.domain.auth import RefreshToken
-from app.domain.document import Document
+from app.domain.document import (
+    STEPS,
+    Document,
+    DocumentStatus,
+    DocumentStep,
+    Step,
+    StepStatus,
+)
 from app.domain.errors import ObjectNotFound, UnknownPartnerJob
 from app.domain.organization import Organization
 from app.domain.partner import PartnerNotification
@@ -180,7 +188,89 @@ class FakeDocumentRepository:
     async def add(self, document: Document) -> None:
         if self.fail_with is not None:
             raise self.fail_with
-        self.documents.append(document)
+        # Four pending step rows, as the real adapter writes in the same
+        # transaction. Every later writer may then assume its row exists.
+        self.documents.append(
+            replace(
+                document,
+                steps=tuple(
+                    DocumentStep(
+                        step=step,
+                        status=StepStatus.PENDING,
+                        attempts=0,
+                        last_error=None,
+                        output=None,
+                        started_at=None,
+                        ended_at=None,
+                    )
+                    for step in STEPS
+                ),
+            )
+        )
+
+    def _index(self, document_id: UUID) -> int:
+        return next(i for i, d in enumerate(self.documents) if d.id == document_id)
+
+    def _replace(self, document_id: UUID, **changes) -> None:
+        i = self._index(document_id)
+        self.documents[i] = replace(self.documents[i], **changes)
+
+    def _replace_step(self, document_id: UUID, step: Step, **changes) -> None:
+        i = self._index(document_id)
+        document = self.documents[i]
+        self.documents[i] = replace(
+            document,
+            steps=tuple(
+                replace(s, **changes) if s.step is step else s for s in document.steps
+            ),
+        )
+
+    async def get(self, document_id: UUID) -> Document | None:
+        return next((d for d in self.documents if d.id == document_id), None)
+
+    async def set_workflow_id(self, document_id: UUID, workflow_id: str) -> None:
+        self._replace(document_id, workflow_id=workflow_id)
+
+    async def start_step(self, document_id: UUID, step: Step, attempt: int) -> None:
+        self._replace_step(
+            document_id,
+            step,
+            status=StepStatus.RUNNING,
+            attempts=attempt,
+            started_at=datetime.now(UTC),
+        )
+        if self.documents[self._index(document_id)].status is DocumentStatus.UPLOADED:
+            self._replace(document_id, status=DocumentStatus.PROCESSING)
+
+    async def finish_step(
+        self, document_id: UUID, step: Step, output: dict | None
+    ) -> None:
+        self._replace_step(
+            document_id,
+            step,
+            status=StepStatus.SUCCEEDED,
+            last_error=None,
+            output=output,
+            ended_at=datetime.now(UTC),
+        )
+
+    async def record_step_error(
+        self, document_id: UUID, step: Step, error: str
+    ) -> None:
+        self._replace_step(document_id, step, last_error=error)
+
+    async def await_partner(self, document_id: UUID, partner_job_id: str) -> None:
+        self._replace(
+            document_id,
+            partner_job_id=partner_job_id,
+            status=DocumentStatus.AWAITING_PARTNER,
+        )
+
+    async def fail(self, document_id: UUID, step: Step) -> None:
+        self._replace(document_id, status=DocumentStatus.FAILED, failed_step=step)
+        self._replace_step(
+            document_id, step, status=StepStatus.FAILED, ended_at=datetime.now(UTC)
+        )
 
     async def list_recent(self, limit: int, offset: int) -> list[Document]:
         # Insertion order is the tie-break, standing in for the real query's
@@ -221,16 +311,95 @@ class InMemoryObjectStore:
         self.objects.pop(key, None)
 
 
+class RecordingUnitOfWork:
+    """Counts commits, so a test can assert *when* one happened."""
+
+    def __init__(self) -> None:
+        self.commits = 0
+
+    async def commit(self) -> None:
+        self.commits += 1
+
+
+class FakePipelineRunner:
+    """Records what it was asked to start, and how many commits preceded it.
+
+    That second number is the point: the document must be committed before the
+    pipeline is enqueued, or a worker can pick up a job whose rows are not yet
+    visible to it.
+    """
+
+    def __init__(
+        self, workflow_id: str = "wf-1", uow: RecordingUnitOfWork | None = None
+    ) -> None:
+        self.workflow_id = workflow_id
+        self.started: list[tuple[UUID, UUID]] = []
+        self._uow = uow
+        self.commits_before_start: int | None = None
+
+    async def start(self, document_id: UUID, org_id: UUID) -> str:
+        self.started.append((document_id, org_id))
+        if self._uow is not None:
+            self.commits_before_start = self._uow.commits
+        return self.workflow_id
+
+
+class FakeDocumentTransaction:
+    """Hands out the same repository every time, counting open transactions."""
+
+    def __init__(self, repository: FakeDocumentRepository | None = None) -> None:
+        self.repository = repository or FakeDocumentRepository(uuid4())
+        self.opened = 0
+        self.closed = 0
+
+    @asynccontextmanager
+    async def __call__(self):
+        self.opened += 1
+        try:
+            yield self.repository
+        finally:
+            self.closed += 1
+
+
 def make_upload_deps(
     org_id: UUID,
     max_bytes: int = 1024,
 ) -> tuple[UploadDeps, FakeDocumentRepository, InMemoryObjectStore]:
     documents = FakeDocumentRepository(org_id)
     store = InMemoryObjectStore()
+    uow = RecordingUnitOfWork()
     deps = UploadDeps(
         documents=documents,
         store=store,
         clock=FakeClock(),
         max_bytes=max_bytes,
+        uow=uow,
+        pipeline=FakePipelineRunner(uow=uow),
     )
     return deps, documents, store
+
+
+def make_document(
+    org_id: UUID | None = None,
+    *,
+    status: DocumentStatus = DocumentStatus.UPLOADED,
+    filename: str = "report.pdf",
+    partner_job_id: str | None = None,
+) -> Document:
+    """A stored document, with the fields the upload path fills in."""
+    now = datetime.now(UTC)
+    document_id = uuid4()
+    org = org_id or uuid4()
+    return Document(
+        id=document_id,
+        org_id=org,
+        uploaded_by=uuid4(),
+        filename=filename,
+        content_type="application/pdf",
+        size_bytes=9,
+        sha256="0" * 64,
+        storage_key=f"{org}/{document_id}",
+        status=status,
+        created_at=now,
+        partner_job_id=partner_job_id,
+    )

@@ -2,13 +2,19 @@
 
 import hashlib
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from uuid import uuid4
 
 from app.domain.auth import AuthContext
 from app.domain.document import Document, DocumentStatus
 from app.domain.errors import EmptyUpload, MissingFilename, UploadTooLarge
-from app.domain.ports import Clock, DocumentRepository, ObjectStore
+from app.domain.ports import (
+    Clock,
+    DocumentRepository,
+    ObjectStore,
+    PipelineRunner,
+    UnitOfWork,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -17,6 +23,10 @@ class UploadDeps:
     store: ObjectStore
     clock: Clock
     max_bytes: int
+    # Processing starts as the upload finishes, so the use case that owns "the
+    # upload is complete" is also the one that says so.
+    uow: UnitOfWork
+    pipeline: PipelineRunner
 
 
 class MeasuredStream:
@@ -113,4 +123,20 @@ async def upload_document(
         await deps.store.delete(storage_key)
         raise
 
-    return document
+    # The upload is now finished, and this is the line that says so: the
+    # document and its four step rows are committed and visible before the
+    # pipeline is enqueued. Enqueueing first is a race the worker usually wins,
+    # because it is not waiting on an HTTP client - it would pick up a job and
+    # find nothing to write to.
+    await deps.uow.commit()
+
+    workflow_id = await deps.pipeline.start(document.id, ctx.org_id)
+    await deps.documents.set_workflow_id(document.id, workflow_id)
+    await deps.uow.commit()
+
+    # Re-read so the caller is handed what is actually stored - the workflow id
+    # and the four pending step rows the repository wrote - rather than the
+    # value this function happened to build.
+    return await deps.documents.get(document.id) or replace(
+        document, workflow_id=workflow_id
+    )

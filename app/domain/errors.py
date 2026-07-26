@@ -75,3 +75,11 @@ class MissingFilename(UploadError):
 
 class ObjectNotFound(DomainError):
     """Read of a storage key that does not exist."""
+
+
+class DocumentNotFound(DomainError):
+    """No document with that id in the caller's organization.
+
+    Deliberately not distinguished from "exists but belongs to someone else":
+    telling those apart is a cross-tenant existence oracle.
+    """

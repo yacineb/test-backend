@@ -9,18 +9,27 @@ Two flavours, and the split is deliberate rather than a flag on one class:
   the second layer, so a misconfigured database is not a silent data leak.
 """
 
+from collections.abc import Sequence
 from datetime import datetime
 from uuid import UUID
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.domain.auth import RefreshToken
-from app.domain.document import Document, DocumentStatus
+from app.domain.document import (
+    STEPS,
+    Document,
+    DocumentStatus,
+    DocumentStep,
+    Step,
+    StepStatus,
+)
 from app.domain.organization import Organization
 from app.domain.user import User
 from app.infrastructure.db.models import (
     DocumentRow,
+    DocumentStepRow,
     OrganizationRow,
     RefreshTokenRow,
     UserRow,
@@ -42,7 +51,20 @@ def _to_organization(row: OrganizationRow) -> Organization:
     return Organization(id=row.id, name=row.name, slug=row.slug)
 
 
-def _to_document(row: DocumentRow) -> Document:
+def _to_step(row: DocumentStepRow) -> DocumentStep:
+    return DocumentStep(
+        step=Step(row.step),
+        status=StepStatus(row.status),
+        attempts=row.attempts,
+        last_error=row.last_error,
+        output=row.output,
+        started_at=row.started_at,
+        ended_at=row.ended_at,
+    )
+
+
+def _to_document(row: DocumentRow, steps: Sequence[DocumentStepRow] = ()) -> Document:
+    order = {step: index for index, step in enumerate(STEPS)}
     return Document(
         id=row.id,
         org_id=row.org_id,
@@ -54,6 +76,10 @@ def _to_document(row: DocumentRow) -> Document:
         storage_key=row.storage_key,
         status=DocumentStatus(row.status),
         created_at=row.created_at,
+        workflow_id=row.workflow_id,
+        partner_job_id=row.partner_job_id,
+        failed_step=Step(row.failed_step) if row.failed_step else None,
+        steps=tuple(sorted((_to_step(s) for s in steps), key=lambda s: order[s.step])),
     )
 
 
@@ -202,6 +228,19 @@ class OrgScopedDocumentRepository:
                 created_at=document.created_at,
             )
         )
+        # All four step rows up front, in the same transaction as the document.
+        # "Not started" is then a row with status=pending, and every later
+        # writer can assume its row exists.
+        self._session.add_all(
+            DocumentStepRow(
+                document_id=document.id,
+                step=step,
+                org_id=self._org_id,
+                status=StepStatus.PENDING,
+                attempts=0,
+            )
+            for step in STEPS
+        )
         # Flush rather than leave it pending: the request transaction commits at
         # teardown, long after the handler could compensate for a failure.
         await self._session.flush()
@@ -215,3 +254,131 @@ class OrgScopedDocumentRepository:
             .offset(offset)
         )
         return [_to_document(row) for row in rows]
+
+    # --- pipeline ---------------------------------------------------------
+    # Written by the API on upload, and by pipeline workers thereafter. Workers
+    # reach them through the same RLS-scoped session, pinned to the org their
+    # workflow was started for.
+
+    async def get(self, document_id: UUID) -> Document | None:
+        """One document with its steps attached."""
+        row = await self._session.scalar(
+            select(DocumentRow).where(
+                DocumentRow.id == document_id, DocumentRow.org_id == self._org_id
+            )
+        )
+        if row is None:
+            return None
+        steps = (
+            await self._session.scalars(
+                select(DocumentStepRow).where(
+                    DocumentStepRow.document_id == document_id,
+                    DocumentStepRow.org_id == self._org_id,
+                )
+            )
+        ).all()
+        return _to_document(row, steps)
+
+    async def _update(self, document_id: UUID, **values) -> None:
+        await self._session.execute(
+            update(DocumentRow)
+            .where(DocumentRow.id == document_id, DocumentRow.org_id == self._org_id)
+            .values(**values)
+        )
+
+    async def _update_step(self, document_id: UUID, step: Step, **values) -> None:
+        await self._session.execute(
+            update(DocumentStepRow)
+            .where(
+                DocumentStepRow.document_id == document_id,
+                DocumentStepRow.step == step,
+                DocumentStepRow.org_id == self._org_id,
+            )
+            .values(**values)
+        )
+
+    async def set_workflow_id(self, document_id: UUID, workflow_id: str) -> None:
+        await self._update(document_id, workflow_id=workflow_id)
+
+    async def start_step(self, document_id: UUID, step: Step, attempt: int) -> None:
+        await self._update_step(
+            document_id,
+            step,
+            status=StepStatus.RUNNING,
+            attempts=attempt,
+            started_at=func.coalesce(DocumentStepRow.started_at, func.now()),
+        )
+        # True exactly once in a document's life, so a conditional UPDATE beats
+        # reading the row on every step of every attempt to find out.
+        await self._session.execute(
+            update(DocumentRow)
+            .where(
+                DocumentRow.id == document_id,
+                DocumentRow.org_id == self._org_id,
+                DocumentRow.status == DocumentStatus.UPLOADED,
+            )
+            .values(status=DocumentStatus.PROCESSING)
+        )
+
+    async def finish_step(
+        self, document_id: UUID, step: Step, output: dict | None
+    ) -> None:
+        await self._update_step(
+            document_id,
+            step,
+            status=StepStatus.SUCCEEDED,
+            last_error=None,
+            output=output,
+            ended_at=func.now(),
+        )
+
+    async def record_step_error(
+        self, document_id: UUID, step: Step, error: str
+    ) -> None:
+        await self._update_step(document_id, step, last_error=error)
+
+    async def await_partner(self, document_id: UUID, partner_job_id: str) -> None:
+        await self._update(
+            document_id,
+            partner_job_id=partner_job_id,
+            status=DocumentStatus.AWAITING_PARTNER,
+        )
+
+    async def fail(self, document_id: UUID, step: Step) -> None:
+        await self._update(document_id, status=DocumentStatus.FAILED, failed_step=step)
+        await self._update_step(
+            document_id, step, status=StepStatus.FAILED, ended_at=func.now()
+        )
+
+
+class UnscopedDocumentRepository:
+    """Resolve a document by partner job id, before any org is known.
+
+    The partner names no tenant - job_id is all it has - so this lookup cannot
+    be RLS-scoped and runs on the system session, exactly like finding a user
+    by email during login. The org is then *derived* from the row that comes
+    back, never taken from the payload.
+    """
+
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def get_by_partner_job_id(self, partner_job_id: str) -> Document | None:
+        row = await self._session.scalar(
+            select(DocumentRow).where(DocumentRow.partner_job_id == partner_job_id)
+        )
+        return _to_document(row) if row else None
+
+    async def complete(self, document_id: UUID) -> None:
+        await self._session.execute(
+            update(DocumentRow)
+            .where(DocumentRow.id == document_id)
+            .values(status=DocumentStatus.READY)
+        )
+
+    async def fail(self, document_id: UUID) -> None:
+        await self._session.execute(
+            update(DocumentRow)
+            .where(DocumentRow.id == document_id)
+            .values(status=DocumentStatus.FAILED, failed_step=Step.EXTERNAL_CALL)
+        )

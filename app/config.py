@@ -142,12 +142,59 @@ class StorageSettings(BaseSettings):
         return self.max_upload_bytes + self.body_overhead_bytes
 
 
+class PipelineSettings(BaseSettings):
+    """Orchestration: where DBOS keeps its state, and how hard it retries.
+
+    The retry numbers are the output of scripts/simulate_pipeline.py, not a
+    preference. Over 200k simulated pipelines, 5 attempts with 1/2/4/8s backoff
+    gives p95 56.9s against the 120s target and a 1.6% give-up rate. DBOS ships
+    retries_allowed=False and max_attempts=3, which would be 14%.
+    """
+
+    model_config = _ENV
+
+    # DBOS owns the `dbos` schema of the same database and migrates it itself.
+    # A sync psycopg URL, not asyncpg: its system-database layer is synchronous,
+    # unlike the application's pools.
+    system_database_url: str = Field(
+        default="postgresql+psycopg://postgres:postgres@db:5432/appdb",
+        validation_alias="DBOS_SYSTEM_DATABASE_URL",
+    )
+
+    max_attempts: int = Field(default=5, validation_alias="PIPELINE_MAX_ATTEMPTS")
+    retry_interval_seconds: float = Field(
+        default=1.0, validation_alias="PIPELINE_RETRY_INTERVAL_SECONDS"
+    )
+    retry_backoff_rate: float = Field(
+        default=2.0, validation_alias="PIPELINE_RETRY_BACKOFF_RATE"
+    )
+
+    # Each in-flight step holds a thread, because the provider mocks block. At
+    # 1k documents/day that is ~0.4 concurrent steps and this number does not
+    # matter; docs/orchestration/capacity.md says where it starts to.
+    queue_concurrency: int = Field(
+        default=50, validation_alias="PIPELINE_QUEUE_CONCURRENCY"
+    )
+
+    # How long an enqueued fan-out branch can sit before a worker notices. Pure
+    # added latency, and it lands twice per document.
+    queue_polling_interval_seconds: float = Field(
+        default=1.0, validation_alias="PIPELINE_QUEUE_POLLING_INTERVAL_SECONDS"
+    )
+
+    # Only the head of the OCR text reaches the read model.
+    ocr_preview_chars: int = Field(
+        default=200, validation_alias="PIPELINE_OCR_PREVIEW_CHARS"
+    )
+
+
 class Settings(BaseSettings):
     model_config = _ENV
 
     db: DatabaseSettings = Field(default_factory=DatabaseSettings)
     jwt: JwtSettings = Field(default_factory=JwtSettings)
     partner: PartnerWebhookSettings = Field(default_factory=PartnerWebhookSettings)
+    pipeline: PipelineSettings = Field(default_factory=PipelineSettings)
     storage: StorageSettings = Field(default_factory=StorageSettings)
 
     # Password given to every seeded user. Local convenience only, and it

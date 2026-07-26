@@ -78,6 +78,32 @@ The fixture drops and recreates the `public` schema, then runs the real Alembic
 migration — so the policies and roles are under test, not a reimplementation of
 them. Point it only at a throwaway database.
 
+## The document pipeline
+
+A completed upload starts a four-step pipeline — OCR, then metadata and
+chunking in parallel, then an outbound call to a partner — orchestrated by
+[DBOS Transact](https://github.com/dbos-inc/dbos-transact-py) as durable,
+checkpointed steps. `POST /documents` returns 201 as soon as the row is
+committed; follow progress with `GET /documents/{id}`.
+
+The pipeline stops at `awaiting_partner`. Only a verified `POST
+/webhooks/partner` moves a document to `ready`.
+
+DBOS keeps its state in the `dbos` schema of the same database and migrates it
+on launch, so compose gains no service. Worker writes go through the same
+RLS-scoped sessions as request writes; a worker's organization comes from its
+workflow argument.
+
+**`app/pipeline/steps.py` is reproduced byte-for-byte from `README.md` and must
+not be edited** — not even reformatted. `tests/unit/test_steps_contract.py`
+diffs it against the statement, and the file is excluded from both `ruff format`
+and its import sorting in `pyproject.toml`.
+
+- [docs/pipeline.md](docs/pipeline.md) — data model, retry policy, the webhook
+  contract, testing
+- [docs/architecture.md](docs/architecture.md) — why DBOS, and what would
+  change the answer at 100k documents/day
+
 ## Authentication and tenancy
 
 Access tokens are JWTs (`JWT_ACCESS_TTL_SECONDS`, 6h default). Refresh tokens
@@ -111,10 +137,12 @@ relative to `pyproject.toml`. Commit both together.
 app/domain/          entities, ports (Protocols), errors — no I/O, no framework
 app/application/     use cases: login, refresh, logout, upload_document
 app/infrastructure/  SQLAlchemy, argon2, PyJWT, POSIX object store — the adapters
-app/api/             FastAPI routers, dependencies, error mapping, body-size guard
+app/api/             FastAPI routers, dependencies, error mapping
+app/pipeline/        DBOS steps and workflow; steps.py is the statement verbatim, body-size guard
 app/config.py        settings, all env-driven
 app/seed.py          idempotent development seed
 app/main.py          app factory and the /health endpoint
+scripts/             simulate_pipeline.py — where the latency numbers come from
 migrations/          Alembic; 0001 schema, roles and RLS policies; 0002 documents
 tests/unit/          use cases against in-memory fakes
 tests/api/           routes with the adapters overridden

@@ -14,10 +14,13 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Index,
+    Integer,
     String,
+    Text,
     Uuid,
     func,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.infrastructure.db.base import Base
@@ -111,5 +114,42 @@ class DocumentRow(Base):
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
 
+    # --- pipeline -------------------------------------------------------
+    workflow_id: Mapped[str | None] = mapped_column(String(128), unique=True)
+    # The partner's only join key. Unique so a duplicate notification can never
+    # resolve to two documents.
+    partner_job_id: Mapped[str | None] = mapped_column(String(128), unique=True)
+    failed_step: Mapped[str | None] = mapped_column(String(32))
+
     # Serves the only list query there is: one org's documents, newest first.
     __table_args__ = (Index("ix_documents_org_id_created_at", "org_id", "created_at"),)
+
+
+class DocumentStepRow(Base):
+    __tablename__ = "document_steps"
+
+    document_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("documents.id", ondelete="CASCADE"), primary_key=True
+    )
+    step: Mapped[str] = mapped_column(String(32), primary_key=True)
+
+    # Denormalized from documents so this table can carry its own RLS policy.
+    # Every other tenant table keys its policy on a column it owns; a policy
+    # that had to join back to documents would be both slower and a special
+    # case in migrations/versions/0003.
+    org_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False
+    )
+
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    last_error: Mapped[str | None] = mapped_column(Text)
+
+    # Always jsonb, never a special case: a payload too big to inline becomes a
+    # pointer inside the same column rather than a different schema.
+    output: Mapped[dict | None] = mapped_column(JSONB)
+
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (Index("ix_document_steps_org_id", "org_id"),)

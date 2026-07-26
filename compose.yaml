@@ -18,6 +18,10 @@ x-app-env: &app-env
   PARTNER_HMAC_SECRET: dev-only-partner-secret-change-me
   PARTNER_WEBHOOK_TOLERANCE_SECONDS: "300" # 5min replay window
   PARTNER_WEBHOOK_SIGNING_HELPER: "true"
+  # DBOS keeps its own tables in the `dbos` schema of the same database and
+  # migrates them itself on launch. A sync psycopg URL, not asyncpg: its
+  # system-database layer is synchronous, unlike the application's pools.
+  DBOS_SYSTEM_DATABASE_URL: postgresql+psycopg://postgres:postgres@db:5432/appdb
 
 services:
   db:

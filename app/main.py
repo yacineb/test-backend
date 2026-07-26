@@ -2,6 +2,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 import anyio.to_thread
+from dbos import DBOS, DBOSConfig
 from fastapi import FastAPI
 from pydantic import BaseModel
 
@@ -12,6 +13,7 @@ from app.api.security_headers import SecurityHeadersMiddleware
 from app.config import get_settings
 from app.infrastructure.db.session import Database
 from app.infrastructure.storage.posix import PosixObjectStore
+from app.pipeline import runtime
 
 
 class Health(BaseModel):
@@ -31,6 +33,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.object_store = PosixObjectStore(
         settings.storage.root, settings.storage.chunk_bytes
     )
+
+    # Pipeline workers have no request behind them, so they are handed the same
+    # pool here rather than through a dependency. DBOS itself is launched by the
+    # middleware installed in create_app, once startup completes.
+    runtime.bind(database)
 
     try:
         yield
@@ -61,6 +68,17 @@ def create_app() -> FastAPI:
     @app.get("/health", tags=["ops"], summary="Liveness probe")
     def health() -> Health:
         return Health(status="ok")
+
+    # Registers the pipeline's steps, workflows and queue, and installs the
+    # middleware that launches DBOS on startup and destroys it on shutdown, so
+    # there is no explicit DBOS.launch() to keep in sync with the lifespan.
+    DBOS(
+        config=DBOSConfig(
+            name="primmo-pipeline",
+            system_database_url=get_settings().pipeline.system_database_url,
+        ),
+        fastapi=app,
+    )
 
     return app
 

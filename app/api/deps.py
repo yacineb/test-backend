@@ -29,11 +29,13 @@ from app.infrastructure.db.repositories import (
     UnscopedRefreshTokenRepository,
     UnscopedUserRepository,
 )
-from app.infrastructure.db.session import Database
-from app.infrastructure.partner_jobs import InMemoryPartnerJobSink
+from app.infrastructure.db.session import Database, TenantUnitOfWork
+from app.infrastructure.partner_jobs import DbPartnerJobSink
 from app.infrastructure.security.hashing import Argon2PasswordHasher
 from app.infrastructure.security.jwt import PyJwtTokenService
 from app.infrastructure.security.signatures import HmacSha256Signer
+from app.pipeline.runtime import TenantDocumentTransaction
+from app.pipeline.workflow import DbosPipelineRunner
 
 SettingsDep = Annotated[Settings, Depends(get_settings)]
 
@@ -174,16 +176,12 @@ async def verify_partner_signature(request: Request, signer: WebhookSignerDep) -
         )
 
 
-@lru_cache
-def _partner_job_sink() -> InMemoryPartnerJobSink:
-    # Cached so the stub's memory survives between requests. Replaced wholesale
-    # when the pipeline lands; see app/infrastructure/partner_jobs.py.
-    return InMemoryPartnerJobSink()
-
-
-def get_webhook_deps(settings: SettingsDep) -> WebhookDeps:
+def get_webhook_deps(settings: SettingsDep, db: DatabaseDep) -> WebhookDeps:
+    # The real sink now that the pipeline issues job ids. It resolves
+    # partner_job_id on the system session, because the partner names no
+    # tenant. Nothing else about the webhook route changed.
     return WebhookDeps(
-        sink=_partner_job_sink(),
+        sink=DbPartnerJobSink(db),
         clock=SystemClock(),
         tolerance=settings.partner.tolerance,
     )
@@ -210,17 +208,48 @@ DocumentRepositoryDep = Annotated[
 ]
 
 
+async def get_upload_session(
+    ctx: CurrentUser, db: DatabaseDep
+) -> AsyncIterator[AsyncSession]:
+    """An RLS-scoped session the handler commits itself.
+
+    Not TenantSessionDep: that commits only when its block ends, which is after
+    the response. The upload has to commit mid-handler so the pipeline it
+    enqueues can see the rows it is about to write to.
+    """
+    async with db.tenant_session_manual(ctx.org_id) as session:
+        yield session
+
+
+UploadSessionDep = Annotated[AsyncSession, Depends(get_upload_session)]
+
+
 def get_upload_deps(
-    documents: DocumentRepositoryDep,
+    session: UploadSessionDep,
+    ctx: CurrentUser,
     store: ObjectStoreDep,
     settings: SettingsDep,
 ) -> UploadDeps:
     return UploadDeps(
-        documents=documents,
+        documents=OrgScopedDocumentRepository(session, ctx.org_id),
         store=store,
         clock=SystemClock(),
         max_bytes=settings.storage.max_upload_bytes,
+        uow=TenantUnitOfWork(session, ctx.org_id),
+        pipeline=DbosPipelineRunner(),
     )
 
 
 UploadDepsDep = Annotated[UploadDeps, Depends(get_upload_deps)]
+
+
+def get_document_transaction(
+    ctx: CurrentUser, db: DatabaseDep
+) -> TenantDocumentTransaction:
+    """One short RLS-scoped transaction per call, for the caller's org."""
+    return TenantDocumentTransaction(db, ctx.org_id)
+
+
+DocumentTransactionDep = Annotated[
+    TenantDocumentTransaction, Depends(get_document_transaction)
+]

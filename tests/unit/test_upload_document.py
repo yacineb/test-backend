@@ -132,3 +132,40 @@ async def test_a_failed_insert_removes_the_object_it_would_have_referenced(ctx):
 
     # No row, so the object is unreachable; it must not be left behind.
     assert store.objects == {}
+
+
+async def test_the_pipeline_is_triggered_when_the_upload_finishes(ctx):
+    """Processing starts as the upload completes, and not one instant earlier.
+
+    The document and its step rows must be committed before the job is
+    enqueued: a worker is not waiting on an HTTP client, so it wins that race
+    and finds nothing to write to.
+    """
+    deps, documents, _ = make_upload_deps(ctx.org_id)
+
+    document = await upload(deps, ctx, b"pdf bytes")
+
+    runner = deps.pipeline
+    assert runner.started == [(document.id, ctx.org_id)]
+    # A commit had already happened by the time start() was called.
+    assert runner.commits_before_start == 1
+
+
+async def test_the_workflow_id_is_recorded_on_the_document(ctx):
+    deps, _, _ = make_upload_deps(ctx.org_id)
+
+    document = await upload(deps, ctx, b"pdf bytes")
+
+    assert document.workflow_id == deps.pipeline.workflow_id
+
+
+async def test_a_failed_upload_never_starts_a_pipeline(ctx):
+    """The row is not there, so there is nothing for a worker to process."""
+    deps, documents, store = make_upload_deps(ctx.org_id)
+    documents.fail_with = RuntimeError("constraint violation")
+
+    with pytest.raises(RuntimeError):
+        await upload(deps, ctx, b"pdf bytes")
+
+    assert deps.pipeline.started == []
+    assert store.objects == {}

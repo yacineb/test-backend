@@ -5,12 +5,13 @@ never imports the domain to inherit from it, and tests can hand-roll fakes.
 """
 
 from collections.abc import AsyncIterator
+from contextlib import AbstractAsyncContextManager
 from datetime import datetime
 from typing import Protocol
 from uuid import UUID
 
 from app.domain.auth import AuthContext, RefreshToken
-from app.domain.document import Document
+from app.domain.document import Document, Step
 from app.domain.organization import Organization
 from app.domain.partner import PartnerNotification
 from app.domain.user import User
@@ -91,9 +92,63 @@ class DocumentRepository(Protocol):
         """Persist a document and flush, so violations surface to the caller."""
         ...
 
+    async def get(self, document_id: UUID) -> Document | None:
+        """With its pipeline steps attached."""
+        ...
+
     async def list_recent(self, limit: int, offset: int) -> list[Document]:
         """Newest first, already scoped to one organization by the adapter."""
         ...
+
+    # --- pipeline projection ---------------------------------------------
+
+    async def set_workflow_id(self, document_id: UUID, workflow_id: str) -> None: ...
+
+    async def start_step(self, document_id: UUID, step: Step, attempt: int) -> None:
+        """Mark a step running on its `attempt`-th try.
+
+        The attempt number is passed in rather than incremented here: the
+        orchestrator owns the retry count, and assigning it keeps the
+        projection idempotent when a step is replayed after a crash.
+        """
+        ...
+
+    async def finish_step(
+        self, document_id: UUID, step: Step, output: dict | None
+    ) -> None: ...
+
+    async def record_step_error(
+        self, document_id: UUID, step: Step, error: str
+    ) -> None:
+        """Record the latest attempt's error without making it terminal."""
+        ...
+
+    async def await_partner(self, document_id: UUID, partner_job_id: str) -> None:
+        """Store the correlation key and the status in one transaction.
+
+        A partner may call back the instant external_call returns, so the key
+        must never be invisible while the status invites the lookup.
+        """
+        ...
+
+    async def fail(self, document_id: UUID, step: Step) -> None: ...
+
+
+class PipelineRunner(Protocol):
+    async def start(self, document_id: UUID, org_id: UUID) -> str:
+        """Enqueue the processing pipeline, returning the workflow id."""
+        ...
+
+
+class DocumentTransaction(Protocol):
+    """Opens one tenant-scoped transaction and hands back a repository.
+
+    A factory rather than a live session because pipeline steps sleep for
+    seconds at a time, and holding a connection across that would waste the
+    pool. Each step takes a transaction, writes, and gives it back.
+    """
+
+    def __call__(self) -> AbstractAsyncContextManager[DocumentRepository]: ...
 
 
 class ObjectStore(Protocol):

@@ -4,6 +4,7 @@ from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
 
 from app.domain.errors import (
+    DocumentNotFound,
     EmptyUpload,
     InactiveUser,
     InvalidAccessToken,
@@ -29,6 +30,9 @@ _STATUS_BY_ERROR = {
     # signed, and an unknown job_id is one we never issued.
     StaleWebhook: status.HTTP_400_BAD_REQUEST,
     UnknownPartnerJob: status.HTTP_404_NOT_FOUND,
+    # Same reasoning as UnknownPartnerJob: a 403 here would confirm that
+    # the document exists in some other tenant.
+    DocumentNotFound: status.HTTP_404_NOT_FOUND,
     UploadTooLarge: status.HTTP_413_CONTENT_TOO_LARGE,
     EmptyUpload: status.HTTP_400_BAD_REQUEST,
     MissingFilename: status.HTTP_400_BAD_REQUEST,
