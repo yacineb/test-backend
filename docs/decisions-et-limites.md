@@ -175,6 +175,7 @@ consacré. Ce tableau est là pour y aller directement.
 | Page comme position, curseur `(created_at, id)` opaque et non signé, index, jointure uploader | [liste-documents.md §2–§4](liste-documents.md) |
 | Projection à sens unique, quatre lignes de step dès la création, politique de retry mesurée, trigger `NOTIFY` et SSE | [pipeline.md](pipeline.md) |
 | HMAC sur les octets bruts vérifié avant parsing, fenêtre de fraîcheur, idempotence du sink | [webhook-entrant.md](webhook-entrant.md) |
+| Réponse du partenaire gardée et non jetée, `409` tant que ce n'est pas `ready`, ce qui n'est pas rendu | [donnees-extraites.md](donnees-extraites.md) |
 | Clés de corrélation, niveaux de log, ce qui n'est jamais loggé | [observabilite.md](observabilite.md) |
 
 Quatre choix n'ont pas de document dédié et tiennent en quatre points :
@@ -298,6 +299,15 @@ le p95 du pipeline contre 120s, le taux d'abandon de 1,6 %, la profondeur réell
 de pagination — est énoncé comme un seuil mesurable, et aucun n'est mesurable
 aujourd'hui dans un système en fonctionnement. D'où F3.
 
+**L18 — `ocr` et `chunks` sont des projections, pas des payloads.**
+`GET /documents/{id}/data` rend `{"chars": n, "preview": …}` et `{"count": n}` ;
+le texte OCR complet et la liste des chunks restent dans le checkpoint DBOS et ne
+sont pas récupérables. Inliner le texte coûterait ~10 Go/jour d'amplification
+d'écriture à la cible, pour une donnée qu'aucun écran n'affiche entièrement.
+*Déclencheur :* le premier consommateur qui a besoin du texte lui-même — c'est
+F6, qui en fait une clé d'object store plutôt qu'une colonne
+([donnees-extraites.md](donnees-extraites.md)).
+
 ## 5. La suite, dans l'ordre
 
 **F1 — Passer l'object store sur S3 (ou tout vrai stockage objet).** Le prochain
@@ -410,10 +420,12 @@ sans ligne (L5) ; et, une fois le presigned en place, les multipart incomplets �
 que S3 expire d'ailleurs seul avec une règle de cycle de vie
 `AbortIncompleteMultipartUpload`.
 
-**F6 — Pousser le texte OCR dans l'object store.** Le step doit renvoyer une clé
-de stockage, pas des mégaoctets de texte. Ça retire de la projection *et* du
-checkpoint le seul payload qui croît avec la taille du document, et c'est du
-câblage plutôt que de l'infrastructure nouvelle.
+**F6 — Pousser le texte OCR dans l'object store** (L18). Le step doit renvoyer
+une clé de stockage, pas des mégaoctets de texte. Ça retire de la projection *et*
+du checkpoint le seul payload qui croît avec la taille du document, et c'est du
+câblage plutôt que de l'infrastructure nouvelle : `GET /documents/{id}/data` rend
+déjà une clé `ocr`, qui porterait alors une référence de stockage plutôt qu'un
+aperçu.
 
 **F7 — Table de dead-letter et endpoint de rejeu** (L8).
 

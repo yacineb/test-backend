@@ -13,10 +13,10 @@ autour :
 ```python
 @dataclass(frozen=True, slots=True)
 class PartnerNotification:
-    job_id: str                  # opaque, émis par le partenaire
-    status: PartnerJobStatus     # completed | failed
+    job_id: str  # opaque, émis par le partenaire
+    status: PartnerJobStatus  # completed | failed
     result: dict[str, Any] | None
-    occurred_at: datetime        # heure côté partenaire, dans la signature
+    occurred_at: datetime  # heure côté partenaire, dans la signature
 ```
 
 `job_id` est la seule clé de jointure. Le partenaire ne sait rien de nos
@@ -72,7 +72,7 @@ fait pas partie de la surface JWT et le partenaire n'a aucun bearer à offrir.
 ## Appliquer le résultat
 
 `DbPartnerJobSink` cherche le document par `partner_job_id` sur la session
-système, applique le résultat, et dérive l'organisation de la ligne trouvée. Deux
+système, applique le résultat, et dérive l'organisation de la ligne trouvée. Trois
 obligations qu'il porte :
 
 - **Lever `UnknownPartnerJob`** quand rien n'attend ce `job_id`, ce que le
@@ -82,6 +82,12 @@ obligations qu'il porte :
   courant du document, pas une table de déduplication à part : un document sorti
   de `awaiting_partner` est décidé, et une reprise obsolète ne doit pas faire
   basculer un document `ready` en `failed`.
+- **Garder le `result`.** Le payload et l'`occurred_at` signé sont écrits dans
+  `documents` par la même `UPDATE` que le statut, et rendus par
+  `GET /documents/{id}/data`. Authentifier un champ sous la signature puis le
+  jeter serait le pire des deux mondes ; et pour une issue `failed`, `result` est
+  le seul récit de pourquoi le document a été refusé
+  ([donnees-extraites.md](donnees-extraites.md)).
 
 ## Le tester depuis Swagger
 

@@ -109,6 +109,11 @@ body, et `POST /webhooks/partner` avec cette signature dans `X-Partner-Signature
 fait passer le document à `ready`. Envoyez **les mêmes octets** aux deux : la
 signature les couvre exactement.
 
+Une fois `ready`, `GET /documents/$DOC/data` rend les données extraites — une
+clé par step, plus le `result` que le partenaire a envoyé. Avant, c'est un `409`
+qui nomme l'état courant plutôt qu'un corps à moitié rempli
+([donnees-extraites.md](docs/donnees-extraites.md)).
+
 Installation, exécution hors Docker, variables d'environnement et commandes de
 test sont dans [CONTRIBUTING.md](CONTRIBUTING.md).
 
@@ -122,6 +127,7 @@ test sont dans [CONTRIBUTING.md](CONTRIBUTING.md).
 | `GET` | `/documents` | l'organisation appelante, plus récents d'abord, paginé par curseur |
 | `GET` | `/documents/{id}` | état de traitement, step par step |
 | `GET` | `/documents/{id}/events` | le même corps, poussé en SSE |
+| `GET` | `/documents/{id}/data` | les données extraites, une fois le document `ready` |
 | `POST` | `/webhooks/partner` | callback partenaire signé en HMAC |
 | `POST` | `/webhooks/partner/sign` | helper de signature, pour `/docs`, dev uniquement |
 | `GET` | `/health` | liveness |
@@ -129,9 +135,9 @@ test sont dans [CONTRIBUTING.md](CONTRIBUTING.md).
 ## Parcours de lecture
 
 **Lisez la première ligne.** C'est l'argumentaire complet du rendu, et il pointe
-vers le reste là où vous voudrez creuser une affirmation précise. Les six autres
+vers le reste là où vous voudrez creuser une affirmation précise. Les sept autres
 sont de la profondeur à la demande — mesures, plans de requête, contrats — pas
-une file d'attente à écouler. Les sept ensemble : environ 82 minutes en lecture
+une file d'attente à écouler. Les huit ensemble : environ 88 minutes en lecture
 attentive, moitié moins en survol.
 
 | Document | La question à laquelle il répond | ~min |
@@ -143,11 +149,13 @@ attentive, moitié moins en survol.
 | [pipeline.md](docs/pipeline.md) | Le DAG, la politique de retry mesurée, la projection, et comment la progression arrive au client en ~80 ms | 12 |
 | [webhook-entrant.md](docs/webhook-entrant.md) | Signature sur les octets bruts, fenêtre anti-rejeu, codes de statut, idempotence | 6 |
 | [observabilite.md](docs/observabilite.md) | Niveaux de log, clés de corrélation, ce qui n'est jamais loggé | 6 |
+| [donnees-extraites.md](docs/donnees-extraites.md) | Où vit la réponse du partenaire et pourquoi pas ailleurs, pourquoi `409` avant `ready`, ce qui n'est pas rendu | 6 |
 
 ## Ce qui est vérifié
 
 ```bash
-uv run pytest        # 256 tests, aucun service requis
+uv run pytest        # 233 tests, aucun service requis
+TEST_POSTGRES_DSN=… uv run pytest   # 270, suite d'intégration comprise
 ```
 
 Les tests unitaires et d'API tournent sur des fakes en mémoire. La suite

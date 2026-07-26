@@ -192,7 +192,9 @@ deux sources de vérité que crée un broker.
   dans la migration.
 
 La migration `0003` ajoute `workflow_id`, `partner_job_id` et `failed_step` à
-`documents`, plus `document_steps` et sa politique. `DocumentStatus` est passé
+`documents`, plus `document_steps` et sa politique. La `0006` y ajoute
+`partner_result` et `partner_occurred_at`, la réponse du partenaire vivant à côté
+du `job_id` auquel elle répond ([donnees-extraites.md](donnees-extraites.md)). `DocumentStatus` est passé
 d'une à cinq valeurs ; c'était déjà une colonne texte plutôt qu'un enum natif,
 précisément pour qu'ajouter des valeurs ne demande pas de verrou.
 
