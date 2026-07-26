@@ -32,6 +32,7 @@ from app.infrastructure.db.repositories import (
 )
 from app.infrastructure.db.session import Database, TenantUnitOfWork
 from app.infrastructure.partner_jobs import DbPartnerJobSink
+from app.infrastructure.progress import ProgressHub
 from app.infrastructure.security.hashing import Argon2PasswordHasher
 from app.infrastructure.security.jwt import PyJwtTokenService
 from app.infrastructure.security.signatures import HmacSha256Signer
@@ -255,3 +256,10 @@ def get_document_transaction(
 DocumentTransactionDep = Annotated[
     TenantDocumentTransaction, Depends(get_document_transaction)
 ]
+
+
+def get_progress_hub(request: Request) -> ProgressHub:
+    return request.app.state.progress
+
+
+ProgressHubDep = Annotated[ProgressHub, Depends(get_progress_hub)]

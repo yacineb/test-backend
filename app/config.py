@@ -188,6 +188,38 @@ class PipelineSettings(BaseSettings):
     )
 
 
+class ProgressSettings(BaseSettings):
+    """Live progress streaming.
+
+    Latency target from the statement is "of the order of a second"; pushing on
+    commit lands well inside that, so these knobs are about connection
+    behaviour rather than freshness.
+    """
+
+    model_config = _ENV
+
+    # Must match the channel migration 0004 notifies on.
+    channel: str = Field(
+        default="document_progress", validation_alias="PROGRESS_CHANNEL"
+    )
+
+    # An SSE comment on an idle stream, so proxies do not reap a connection
+    # that is simply waiting for a slow OCR step.
+    heartbeat_seconds: float = Field(
+        default=15.0, validation_alias="PROGRESS_HEARTBEAT_SECONDS"
+    )
+
+    # A document can sit in awaiting_partner for hours. Capping a single
+    # connection bounds accumulation; the client reconnects and is handed a
+    # fresh snapshot, so nothing is lost by closing.
+    max_stream_seconds: float = Field(
+        default=300.0, validation_alias="PROGRESS_MAX_STREAM_SECONDS"
+    )
+
+    # SSE `retry:` - how long the client waits before reconnecting.
+    retry_ms: int = Field(default=2000, validation_alias="PROGRESS_RETRY_MS")
+
+
 class Settings(BaseSettings):
     model_config = _ENV
 
@@ -195,6 +227,7 @@ class Settings(BaseSettings):
     jwt: JwtSettings = Field(default_factory=JwtSettings)
     partner: PartnerWebhookSettings = Field(default_factory=PartnerWebhookSettings)
     pipeline: PipelineSettings = Field(default_factory=PipelineSettings)
+    progress: ProgressSettings = Field(default_factory=ProgressSettings)
     storage: StorageSettings = Field(default_factory=StorageSettings)
 
     # Password given to every seeded user. Local convenience only, and it

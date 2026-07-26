@@ -89,6 +89,11 @@ committed; follow progress with `GET /documents/{id}`.
 The pipeline stops at `awaiting_partner`. Only a verified `POST
 /webhooks/partner` moves a document to `ready`.
 
+Progress is pushed, not polled: `GET /documents/{id}/events` streams
+Server-Sent Events, woken by a Postgres `NOTIFY` fired on commit, so a status
+change reaches the client in milliseconds. Swagger cannot render a stream —
+use `curl -N`, or poll `GET /documents/{id}` for the identical body.
+
 DBOS keeps its state in the `dbos` schema of the same database and migrates it
 on launch, so compose gains no service. Worker writes go through the same
 RLS-scoped sessions as request writes; a worker's organization comes from its

@@ -62,8 +62,9 @@ class DocumentSummaryResponse(BaseModel):
 
     id: UUID
     filename: str
-    # Processing status. Only "uploaded" is reachable until the pipeline lands;
-    # a string rather than an enum so new states do not break old clients.
+    # Processing status: uploaded, processing, awaiting_partner, ready or
+    # failed. A string rather than an enum so new states do not break old
+    # clients.
     status: str
     uploaded_by: UploaderResponse
     created_at: datetime

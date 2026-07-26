@@ -1,13 +1,18 @@
+import asyncio
 from collections.abc import AsyncIterator
+from time import monotonic
 from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, File, Query, UploadFile, status
+from fastapi.responses import StreamingResponse
 
 from app.api.cursors import CursorDep, encode_cursor
 from app.api.deps import (
     CurrentUser,
     DocumentRepositoryDep,
+    DocumentTransactionDep,
+    ProgressHubDep,
     SettingsDep,
     UploadDepsDep,
 )
@@ -20,8 +25,10 @@ from app.api.schemas import (
     to_detail,
 )
 from app.application.upload_document import upload_document
+from app.config import Settings
 from app.domain.document import Document, DocumentSummary
 from app.domain.errors import DocumentNotFound
+from app.infrastructure.progress import ProgressHub
 
 router = APIRouter(prefix="/documents", tags=["documents"])
 
@@ -146,3 +153,107 @@ async def get_document(
     if document is None:
         raise DocumentNotFound(f"no document {document_id}")
     return to_detail(document)
+
+
+def _sse(event: str, event_id: int, data: str) -> str:
+    return f"event: {event}\nid: {event_id}\ndata: {data}\n\n"
+
+
+async def _progress_events(
+    document_id: UUID,
+    transaction: DocumentTransactionDep,
+    hub: ProgressHub,
+    settings: Settings,
+) -> AsyncIterator[str]:
+    """Snapshot, then one event per change, until terminal or the cap.
+
+    Reads go through `transaction` rather than a request-scoped session: the
+    response body is produced after the endpoint has returned, by which time a
+    dependency-managed session is already closed.
+    """
+    progress = settings.progress
+    deadline = monotonic() + progress.max_stream_seconds
+    event_id = 0
+    last_payload: str | None = None
+
+    async with hub.subscribe(document_id) as changed:
+        while True:
+            async with transaction() as documents:
+                document = await documents.get(document_id)
+            if document is None:  # deleted, or never visible to this tenant
+                return
+
+            payload = to_detail(document).model_dump_json()
+            # Two rows of one logical change notify twice; the queue coalesces
+            # what it can and this drops the rest.
+            if payload != last_payload:
+                event_id += 1
+                last_payload = payload
+                yield _sse("progress", event_id, payload)
+
+            if document.is_terminal:
+                return
+
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                # Closing loses nothing: the client reconnects and the first
+                # thing it gets is a fresh snapshot.
+                yield f"retry: {progress.retry_ms}\n\n"
+                return
+
+            try:
+                await asyncio.wait_for(
+                    changed.get(), timeout=min(progress.heartbeat_seconds, remaining)
+                )
+            except TimeoutError:
+                # Idle, not finished. Keep the connection off a proxy's reaper.
+                yield ": ping\n\n"
+
+
+@router.get(
+    "/{document_id}/events",
+    summary="Live processing status (Server-Sent Events)",
+    response_class=StreamingResponse,
+    description=(
+        "Streams `text/event-stream`. The first event is always a full "
+        "snapshot, so a reconnect needs no replay, and each subsequent event "
+        "carries the same body as `GET /documents/{document_id}`.\n\n"
+        "Pushed from a Postgres `NOTIFY` fired on commit, so a change reaches "
+        "the client in milliseconds rather than on a poll boundary.\n\n"
+        "The stream ends when the document is `ready` or `failed`. Long-lived "
+        "connections are capped and closed with a `retry:` hint; the client "
+        "reconnects and is handed a fresh snapshot.\n\n"
+        "**Swagger cannot render a stream** - it will appear to hang. Use:\n\n"
+        '```\ncurl -N -H "Authorization: Bearer $TOKEN" \\\\\n'
+        "  http://localhost:8000/documents/{document_id}/events\n```"
+    ),
+    responses={
+        200: {"content": {"text/event-stream": {}}},
+        404: {"description": "No such document in this organization"},
+    },
+)
+async def stream_document_progress(
+    document_id: UUID,
+    ctx: CurrentUser,
+    documents: DocumentRepositoryDep,
+    transaction: DocumentTransactionDep,
+    hub: ProgressHubDep,
+    settings: SettingsDep,
+) -> StreamingResponse:
+    # Authorize before subscribing, so the hub only ever routes to a caller who
+    # has already proved the document is theirs.
+    if await documents.get(document_id) is None:
+        raise DocumentNotFound(f"no document {document_id}")
+
+    return StreamingResponse(
+        _progress_events(document_id, transaction, hub, settings),
+        media_type="text/event-stream",
+        headers={
+            # nginx buffers responses by default, which would hold events back
+            # until the buffer fills - the one thing this endpoint must not do.
+            "X-Accel-Buffering": "no",
+        },
+        # No Cache-Control here on purpose: SecurityHeadersMiddleware assigns
+        # `no-store, max-age=0` to every response, which is stronger than the
+        # `no-cache` an SSE endpoint would normally set for itself.
+    )

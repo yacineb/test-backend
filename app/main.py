@@ -12,6 +12,11 @@ from app.api.routers import auth, documents, me, webhooks
 from app.api.security_headers import SecurityHeadersMiddleware
 from app.config import get_settings
 from app.infrastructure.db.session import Database
+from app.infrastructure.progress import (
+    ProgressHub,
+    ProgressListener,
+    asyncpg_dsn,
+)
 from app.infrastructure.storage.posix import PosixObjectStore
 from app.pipeline import runtime
 
@@ -39,9 +44,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # middleware installed in create_app, once startup completes.
     runtime.bind(database)
 
+    # One LISTEN connection for this process, fanning out in memory to whatever
+    # streams it happens to be serving. See app/infrastructure/progress.py.
+    app.state.progress = ProgressHub()
+    listener = ProgressListener(
+        dsn=asyncpg_dsn(settings.db.url),
+        channel=settings.progress.channel,
+        hub=app.state.progress,
+    )
+    await listener.start()
+
     try:
         yield
     finally:
+        await listener.stop()
         await database.dispose()
 
 

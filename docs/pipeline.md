@@ -71,6 +71,74 @@ The contract, which `DbPartnerJobSink` relies on:
 
 `ready` is reachable only through this path.
 
+## Following progress
+
+`GET /documents/{id}/events` streams `text/event-stream`. Measured against the
+running stack, a status change reaches a connected client in **~80ms** — the
+target was "of the order of a second".
+
+The mechanism is one hop, because the event source already exists: every status
+change is a write to `document_steps`, and migration `0004` turns every such
+write into a `NOTIFY`. Postgres is already the broker, so nothing was added.
+
+```
+worker / webhook ──commit──► trigger ──pg_notify('document_progress', <doc_id>)
+                                                    │
+                                     one LISTEN connection per API process
+                                                    │
+                                          in-memory fan-out
+                                                    │
+                                  SSE task re-reads projection → yields
+```
+
+**Why a trigger rather than application code.** `NOTIFY` is transactional: it
+is delivered on commit and never for a write that rolls back, so a listener is
+never told about a row it could not read. And it covers every write path by
+construction — including the partner webhook, which sets `ready` through a
+different repository on the *system* session, and which is exactly the sort of
+path application-level notification forgets.
+`tests/integration/test_progress_notify.py` pins all three properties.
+
+**Why the payload is only an id.** Subscribers re-read the projection, so a
+duplicated, coalesced or out-of-order notification is harmless, there is no
+8000-byte payload cap to design around, and no tenant data crosses a channel
+every process listens to. The event body is the same
+`DocumentDetailResponse` the polling endpoint returns, so the two cannot drift.
+
+**Why it costs so little.** One `LISTEN` connection *per process*, not per
+subscriber: 5,000 watchers cost 5,000 sockets and one database connection.
+Reads scale with events, not with watchers × seconds — 37–112× less work than
+1s polling at the 12-month target:
+
+| | watchers | push | poll @1s |
+|---|---|---|---|
+| today | 50 | 0.4 events/s | 50 req/s |
+| 12-month peak | 5,000 | 134 events/s | 5,000 req/s |
+
+Three details that keep it honest:
+
+- **Coalescing is free.** Each subscriber's queue is `maxsize=1` and drops when
+  full — a pending wake already means "re-read", so a second is redundant. The
+  debouncer is the queue, with no timer.
+- **Every connection opens with a snapshot**, which is what makes reconnection
+  need no replay, and what makes the 5-minute connection cap safe rather than
+  lossy. A document parked in `awaiting_partner` overnight does not hold a
+  socket overnight.
+- **A listener reconnect wakes every subscriber**, because notifications that
+  arrived while the connection was down are gone.
+
+**Swagger cannot render a stream** — it will appear to hang. Use `curl -N`, or
+poll `GET /documents/{id}`, which returns the identical body.
+
+```bash
+curl -N -H "Authorization: Bearer $TOKEN" \
+  http://localhost:8000/documents/$DOC/events
+```
+
+Browser `EventSource` cannot send an `Authorization` header, so a real UI would
+need a short-lived stream ticket. Not built: there is no UI, and inventing the
+ticket endpoint now would be speculative.
+
 ## Retry policy: measured, not chosen
 
 The provider mocks sleep *before* the failure check, so a failed attempt costs
@@ -191,8 +259,8 @@ the real `random` module, and everything else using it, is untouched.
 - **A sweep for ghosted partners.** `status = 'awaiting_partner' AND updated_at
   < now() - interval '24h'` has no home yet; today such a document waits
   forever.
-- **The real-time transport.** SSE over `LISTEN/NOTIFY` on the projection —
-  one-directional, and reconnection is free.
+- **A stream ticket for browsers**, so `EventSource` can authenticate without
+  putting a token in the query string.
 - **Dead-letter handling and a replay endpoint.** 1.6% give-up is ~1,600
   documents/day at target. Checkpointing means replay resumes rather than
   restarts; nothing exposes that yet.
