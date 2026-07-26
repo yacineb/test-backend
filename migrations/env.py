@@ -13,7 +13,12 @@ from app.infrastructure.db.base import Base
 config = context.config
 
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    # disable_existing_loggers=False, against the stock Alembic template's
+    # default of True. That default sets .disabled on every logger the ini does
+    # not name -- including all of app.* -- so anything that runs a migration
+    # in-process afterwards logs nothing at all, silently. Harmless in the
+    # migrate container, which exits; not harmless anywhere sharing a process.
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 # Migrations run as the owning role, not as app_rw: they create the tables and
 # the policies that constrain app_rw.

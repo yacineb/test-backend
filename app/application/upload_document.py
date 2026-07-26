@@ -1,6 +1,7 @@
 """Store an uploaded file and record it against the caller's organization."""
 
 import hashlib
+import logging
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, replace
 from uuid import uuid4
@@ -30,6 +31,8 @@ ACCEPTED_MIME = "application/pdf"
 # Every magic signature puremagic knows sits far inside this. Held in memory
 # only until the type is decided.
 SNIFF_BYTES = 4096
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -168,8 +171,27 @@ async def upload_document(
         # at request teardown, which is what makes this cleanup reachable at
         # all. A crash between the two still leaks an object; that is what the
         # orphan sweeper in docs/upload-architecture.md is for.
+        #
+        # ERROR because bytes were durably written and are now unreferenced.
+        # The key is the whole point of the line: it is what an operator needs
+        # to find the orphan if the delete below also fails.
+        logger.exception(
+            "upload.row_failed", extra={"storage_key": storage_key, "orphaned": True}
+        )
         await deps.store.delete(storage_key)
         raise
+
+    logger.info(
+        "upload.stored",
+        extra={
+            "document_id": str(document.id),
+            "size_bytes": document.size_bytes,
+            # Enough to correlate two uploads of the same file, or to check a
+            # stored object against its row, without the full digest.
+            "sha256_prefix": document.sha256[:12],
+            "content_type": detected,
+        },
+    )
 
     # The upload is now finished, and this is the line that says so: the
     # document and its four step rows are committed and visible before the
@@ -181,6 +203,14 @@ async def upload_document(
     workflow_id = await deps.pipeline.start(document.id, ctx.org_id)
     await deps.documents.set_workflow_id(document.id, workflow_id)
     await deps.uow.commit()
+
+    # The hand-off from request to worker. This is the line that lets someone
+    # holding a request_id follow the work into the pipeline, where there is no
+    # longer a request to correlate against -- workflow_id takes over from here.
+    logger.info(
+        "pipeline.enqueued",
+        extra={"document_id": str(document.id), "workflow_id": workflow_id},
+    )
 
     # Re-read so the caller is handed what is actually stored - the workflow id
     # and the four pending step rows the repository wrote - rather than the

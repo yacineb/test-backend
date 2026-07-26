@@ -6,6 +6,7 @@ OpenAPI schema so Swagger gets a working Authorize button; and raising
 HTTPException from a dependency beats hand-building a Response.
 """
 
+import logging
 from collections.abc import AsyncIterator
 from functools import lru_cache
 from typing import Annotated
@@ -36,8 +37,11 @@ from app.infrastructure.progress import ProgressHub
 from app.infrastructure.security.hashing import Argon2PasswordHasher
 from app.infrastructure.security.jwt import PyJwtTokenService
 from app.infrastructure.security.signatures import HmacSha256Signer
+from app.observability import bind_context
 from app.pipeline.runtime import TenantDocumentTransaction
 from app.pipeline.workflow import DbosPipelineRunner
+
+logger = logging.getLogger(__name__)
 
 SettingsDep = Annotated[Settings, Depends(get_settings)]
 
@@ -75,11 +79,18 @@ _bearer = HTTPBearer(
 )
 
 
-def get_auth_context(
+async def get_auth_context(
     credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer)],
     tokens: TokenServiceDep,
 ) -> AuthContext:
-    """Resolve user_id and org_id for the current request, or 401."""
+    """Resolve user_id and org_id for the current request, or 401.
+
+    `async` deliberately, even though nothing here awaits: FastAPI runs a *sync*
+    dependency in a worker thread, which gets a copy of the context, so the
+    contextvars bound below would be discarded on return and every log line
+    would lose its tenant. Decoding an HS256 token is microseconds of CPU, so
+    there is nothing to gain from the threadpool anyway.
+    """
     if credentials is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -87,13 +98,24 @@ def get_auth_context(
             headers={"WWW-Authenticate": "Bearer"},
         )
     try:
-        return tokens.decode_access_token(credentials.credentials)
+        ctx = tokens.decode_access_token(credentials.credentials)
     except InvalidAccessToken as exc:
+        # Converted to HTTPException here, so it never reaches the domain-error
+        # handler that logs the rest of the refusals. The reason matters: an
+        # expired token is routine, a bad signature is not.
+        logger.warning("auth.token.rejected", extra={"reason": str(exc)})
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=str(exc),
             headers={"WWW-Authenticate": "Bearer"},
         ) from exc
+
+    # Every log line for the rest of this request is now attributable to a
+    # tenant and a user, without a single call site passing them along. This is
+    # the one place both are known and trusted, so it is the only place that
+    # should be binding them.
+    bind_context(org_id=str(ctx.org_id), user_id=str(ctx.user_id))
+    return ctx
 
 
 CurrentUser = Annotated[AuthContext, Depends(get_auth_context)]
@@ -172,6 +194,14 @@ async def verify_partner_signature(request: Request, signer: WebhookSignerDep) -
     signature = request.headers.get(SIGNATURE_HEADER)
     body = await request.body()
     if signature is None or not signer.verify(body, signature):
+        # This endpoint is reachable without a token, so a failure here is the
+        # one worth watching: it is either the partner misconfigured or someone
+        # guessing at the secret. The signature itself is not logged -- it is a
+        # (failed) authenticator, and the distinction below is the useful part.
+        logger.warning(
+            "webhook.partner.unverified",
+            extra={"reason": "missing" if signature is None else "mismatch"},
+        )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=f"missing or invalid {SIGNATURE_HEADER}",

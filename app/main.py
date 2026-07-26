@@ -1,3 +1,4 @@
+import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -8,6 +9,7 @@ from pydantic import BaseModel
 
 from app.api.errors import register_error_handlers
 from app.api.middleware import MaxBodySizeMiddleware
+from app.api.request_context import RequestContextMiddleware
 from app.api.routers import auth, documents, me, webhooks
 from app.api.security_headers import SecurityHeadersMiddleware
 from app.config import get_settings
@@ -18,7 +20,10 @@ from app.infrastructure.progress import (
     asyncpg_dsn,
 )
 from app.infrastructure.storage.posix import PosixObjectStore
+from app.observability import configure_logging
 from app.pipeline import runtime
+
+logger = logging.getLogger(__name__)
 
 
 class Health(BaseModel):
@@ -54,14 +59,29 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     await listener.start()
 
+    # The one startup line worth printing: it states the configuration that
+    # decides where bytes go and how large they may be, which is the first thing
+    # anyone asks when an upload behaves unexpectedly in an environment.
+    logger.info(
+        "app.started",
+        extra={
+            "storage_root": str(settings.storage.root),
+            "max_upload_bytes": settings.storage.max_upload_bytes,
+            "log_level": settings.logging.level,
+        },
+    )
     try:
         yield
     finally:
+        logger.info("app.stopping")
         await listener.stop()
         await database.dispose()
 
 
 def create_app() -> FastAPI:
+    settings = get_settings()
+    configure_logging(settings.logging.level, settings.logging.format)
+
     app = FastAPI(
         title="Document processing API",
         version="0.1.0",
@@ -69,12 +89,12 @@ def create_app() -> FastAPI:
     )
     # Must sit ahead of the multipart parser, which buffers file parts to disk
     # before any endpoint code runs. See app/api/middleware.py.
-    app.add_middleware(
-        MaxBodySizeMiddleware, max_bytes=get_settings().storage.max_body_bytes
-    )
-    # Added last, so it wraps outermost and also decorates the 413 that
-    # MaxBodySizeMiddleware returns without ever reaching a route.
+    app.add_middleware(MaxBodySizeMiddleware, max_bytes=settings.storage.max_body_bytes)
     app.add_middleware(SecurityHeadersMiddleware)
+    # Added last, so it wraps outermost: every other middleware's output --
+    # including the 413 that never reaches a route -- is emitted with a request
+    # id bound and counted in the access log.
+    app.add_middleware(RequestContextMiddleware)
     register_error_handlers(app)
     app.include_router(auth.router)
     app.include_router(me.router)

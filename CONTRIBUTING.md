@@ -161,6 +161,24 @@ Dependencies point inward only: `domain` imports nothing but the standard
 library, `application` imports `domain`, `infrastructure` implements the
 domain's ports, and `api` wires them together.
 
+## Logging
+
+Structured JSON on stdout. Application code uses the standard library
+(`logging.getLogger(__name__)`); structlog is configured once in
+`app/observability.py` as the renderer, so no layer gains a dependency on it.
+
+Every response carries `X-Request-Id`, and that id is bound to every log line
+for the request — including `org_id` and `user_id` once authenticated. Work that
+outlives the request is correlated by `document_id` and `workflow_id` instead.
+
+| variable | default | meaning |
+|---|---|---|
+| `LOG_LEVEL` | `INFO` | root level; `DEBUG` also unmutes SQL and DBOS |
+| `LOG_FORMAT` | `json` | `console` for a readable local run |
+
+[docs/observability.md](docs/observability.md) covers what each level is for,
+what is never logged, and the two footguns this configuration disarms.
+
 ## Security headers
 
 `SecurityHeadersMiddleware` (`app/api/security_headers.py`) applies the OWASP

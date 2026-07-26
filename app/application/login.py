@@ -1,7 +1,11 @@
+import logging
+
 from app.application.deps import AuthDeps
 from app.application.tokens import issue_token_pair
 from app.domain.auth import TokenPair
 from app.domain.errors import InactiveUser, InvalidCredentials
+
+logger = logging.getLogger(__name__)
 
 
 async def login(deps: AuthDeps, email: str, password: str) -> TokenPair:
@@ -21,4 +25,10 @@ async def login(deps: AuthDeps, email: str, password: str) -> TokenPair:
 
     pair = await issue_token_pair(deps, user.id, user.org_id)
     await deps.uow.commit()
+    # Who got a session, and for which tenant. The tokens themselves are never
+    # logged -- an access token in a log file is a working credential.
+    logger.info(
+        "auth.login.succeeded",
+        extra={"user_id": str(user.id), "org_id": str(user.org_id)},
+    )
     return pair

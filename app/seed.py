@@ -7,6 +7,7 @@ tenants, which is exactly what no request-scoped code is allowed to do.
 """
 
 import asyncio
+import logging
 from dataclasses import dataclass
 
 from sqlalchemy import select
@@ -16,6 +17,7 @@ from app.config import Settings, get_settings
 from app.infrastructure.db.models import OrganizationRow, UserRow
 from app.infrastructure.db.session import Database
 from app.infrastructure.security.hashing import Argon2PasswordHasher
+from app.observability import configure_logging
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,6 +70,9 @@ async def _seed_org(session: AsyncSession, spec: SeedOrg, password_hash: str) ->
         await session.flush()
 
 
+logger = logging.getLogger(__name__)
+
+
 async def seed(settings: Settings | None = None) -> None:
     settings = settings or get_settings()
     database = Database(settings)
@@ -84,9 +89,13 @@ async def seed(settings: Settings | None = None) -> None:
         await database.dispose()
 
     for spec in SEED_ORGS:
-        print(f"seeded {spec.slug:8} {spec.user.email}")
-    print(f"password for every seeded user: {settings.seed_password}")
+        logger.info(
+            "seed.org.ready",
+            extra={"slug": spec.slug, "email": spec.user.email},
+        )
 
 
 if __name__ == "__main__":
-    asyncio.run(seed())
+    settings = get_settings()
+    configure_logging(settings.logging.level, settings.logging.format)
+    asyncio.run(seed(settings))

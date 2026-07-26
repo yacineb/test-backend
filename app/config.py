@@ -14,6 +14,7 @@ instead of turning it into DB_URL.
 from datetime import timedelta
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
 from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -220,11 +221,29 @@ class ProgressSettings(BaseSettings):
     retry_ms: int = Field(default=2000, validation_alias="PROGRESS_RETRY_MS")
 
 
+class LoggingSettings(BaseSettings):
+    """Verbosity and output shape.
+
+    `json` by default because logs are read by machines first -- shipped,
+    indexed, and queried by `request_id`. `console` is the human-readable
+    alternative for a local run; see app/observability.py for what each level
+    is meant to carry.
+    """
+
+    model_config = _ENV
+
+    level: str = Field(default="INFO", validation_alias="LOG_LEVEL")
+    format: Literal["json", "console"] = Field(
+        default="json", validation_alias="LOG_FORMAT"
+    )
+
+
 class Settings(BaseSettings):
     model_config = _ENV
 
     db: DatabaseSettings = Field(default_factory=DatabaseSettings)
     jwt: JwtSettings = Field(default_factory=JwtSettings)
+    logging: LoggingSettings = Field(default_factory=LoggingSettings)
     partner: PartnerWebhookSettings = Field(default_factory=PartnerWebhookSettings)
     pipeline: PipelineSettings = Field(default_factory=PipelineSettings)
     progress: ProgressSettings = Field(default_factory=ProgressSettings)

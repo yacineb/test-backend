@@ -53,5 +53,10 @@ EXPOSE 8000
 # --no-server-header: don't advertise the server software. It has to be set
 # here rather than in the security-headers middleware, because uvicorn appends
 # its banner after the ASGI app has already returned its headers.
+#
+# --no-access-log: RequestContextMiddleware emits the access line itself, with
+# the request id, tenant and duration attached. Leaving uvicorn's on would log
+# every request twice, and its copy is the one without the correlation fields.
 ENTRYPOINT ["/app/.venv/bin/python", "-m", "uvicorn", "app.main:app", \
-            "--host", "0.0.0.0", "--port", "8000", "--no-server-header"]
+            "--host", "0.0.0.0", "--port", "8000", \
+            "--no-server-header", "--no-access-log"]

@@ -5,6 +5,7 @@ here by write/fsync/rename, the same way an S3 adapter would meet it with
 multipart upload and abort. Nothing is emulated.
 """
 
+import logging
 import os
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -13,6 +14,8 @@ from uuid import uuid4
 import anyio.to_thread
 
 from app.domain.errors import ObjectNotFound
+
+logger = logging.getLogger(__name__)
 
 
 def _write_all(fd: int, data: bytes) -> None:
@@ -89,6 +92,15 @@ class PosixObjectStore:
             await anyio.to_thread.run_sync(_commit, tmp, final)
         except BaseException:
             # Includes cancellation: an aborted upload leaves no temp file.
+            #
+            # DEBUG, not ERROR: the overwhelmingly common cause is a client
+            # disconnect or a size/type rejection upstream, which are already
+            # reported where they are decided. A genuine disk failure surfaces
+            # as the exception this re-raises, and is logged by the caller that
+            # knows what it was doing.
+            logger.debug(
+                "storage.put.aborted", extra={"storage_key": key, "written": written}
+            )
             await anyio.to_thread.run_sync(_unlink_quietly, tmp)
             raise
 

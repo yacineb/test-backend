@@ -1,5 +1,7 @@
 """Domain error -> HTTP status. The only place that mapping is allowed to live."""
 
+import logging
+
 from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
 
@@ -17,6 +19,8 @@ from app.domain.errors import (
     UnsupportedFileType,
     UploadTooLarge,
 )
+
+logger = logging.getLogger(__name__)
 
 # ObjectNotFound is deliberately absent: no route reads from the object store
 # yet, so a mapping for it could never fire. It arrives with the download
@@ -48,6 +52,22 @@ def register_error_handlers(app: FastAPI) -> None:
 
 def _handler(status_code: int):
     async def handle(_: Request, exc: Exception) -> JSONResponse:
+        # Every refusal is logged in one place rather than at each raise site.
+        # The exception message already carries the specifics (which limit, what
+        # the file sniffed as), so the call sites stay free of logging noise.
+        #
+        # WARNING, not ERROR: these are the API telling a client it got
+        # something wrong, which is the system working. Paging on a rejected
+        # PNG is how alerting gets ignored. They are still worth seeing in
+        # aggregate -- a spike in 401s or 413s is a different story entirely.
+        logger.warning(
+            "request.rejected",
+            extra={
+                "status": status_code,
+                "error": type(exc).__name__,
+                "detail": str(exc),
+            },
+        )
         headers = (
             {"WWW-Authenticate": "Bearer"}
             if status_code == status.HTTP_401_UNAUTHORIZED
