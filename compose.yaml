@@ -1,8 +1,63 @@
+# Boot order is db -> migrate -> seed -> api, each gated on the previous one
+# actually finishing. The runtime image has no shell, so every one-shot command
+# is given in exec form.
+
+x-app-env: &app-env
+  DATABASE_URL: postgresql+asyncpg://app_rw:app_rw@db:5432/appdb
+  AUTH_DATABASE_URL: postgresql+asyncpg://app_auth:app_auth@db:5432/appdb
+  MIGRATION_DATABASE_URL: postgresql+asyncpg://postgres:postgres@db:5432/appdb
+  APP_RW_PASSWORD: app_rw
+  APP_AUTH_PASSWORD: app_auth
+  JWT_SECRET: dev-only-secret-change-me-in-production
+  JWT_ACCESS_TTL_SECONDS: "21600" # 6h
+  JWT_REFRESH_TTL_SECONDS: "2592000" # 30d
+  SEED_PASSWORD: password123
+
 services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: appdb
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d appdb"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 3s
+    restart: unless-stopped
+
+  # Creates the app_rw / app_auth roles, the schema, and the RLS policies.
+  # Runs as the owning superuser, which app_rw deliberately is not.
+  migrate:
+    build: .
+    entrypoint: ["/app/.venv/bin/python", "-m", "alembic", "upgrade", "head"]
+    environment: *app-env
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
+  seed:
+    build: .
+    entrypoint: ["/app/.venv/bin/python", "-m", "app.seed"]
+    environment: *app-env
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: "no"
+
   api:
     build: .
     ports:
       - "8000:8000"
+    environment: *app-env
+    depends_on:
+      seed:
+        condition: service_completed_successfully
     healthcheck:
       # The image has no shell and no curl, so probe with the Python we ship.
       test:
@@ -15,3 +70,6 @@ services:
       retries: 3
       start_period: 5s
     restart: unless-stopped
+
+volumes:
+  pgdata:

@@ -4,7 +4,14 @@ version = "0.1.0"
 description = "Document processing API"
 requires-python = ">=3.14"
 dependencies = [
+    "alembic>=1.14",
+    "argon2-cffi>=23.1",
+    "asyncpg>=0.30",
     "fastapi>=0.115",
+    "pydantic-settings>=2.7",
+    "pydantic[email]>=2.10",
+    "pyjwt>=2.10",
+    "sqlalchemy[asyncio]>=2.0",
     "uvicorn[standard]>=0.32",
 ]
 
@@ -24,6 +31,9 @@ pythonpath = ["."]
 
 [tool.ruff]
 target-version = "py314"
+# ruff formats Python inside Markdown code blocks. README.md quotes the pipeline
+# stubs verbatim and they must stay byte-for-byte as given.
+extend-exclude = ["README.md"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]

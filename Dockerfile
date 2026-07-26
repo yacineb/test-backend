@@ -18,6 +18,8 @@ COPY pyproject.toml uv.lock ./
 RUN uv sync --locked --no-dev
 
 COPY app ./app
+COPY alembic.ini ./alembic.ini
+COPY migrations ./migrations
 
 # Lean and secure runtime stage: distroless, no shell and no package manager.
 FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
@@ -25,6 +27,10 @@ FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
 COPY --from=builder /opt/python /opt/python
 COPY --from=builder /app/.venv /app/.venv
 COPY --from=builder /src/app /app/app
+# Migrations ship with the image so the migrate service runs the exact revision
+# that matches this build.
+COPY --from=builder /src/alembic.ini /app/alembic.ini
+COPY --from=builder /src/migrations /app/migrations
 
 WORKDIR /app
 
