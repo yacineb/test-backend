@@ -7,12 +7,13 @@ If this passes, the push half of progress tracking is real.
 """
 
 import asyncio
+from datetime import UTC, datetime
 from uuid import uuid4
 
 import asyncpg
 import pytest
 
-from app.domain.document import Step
+from app.domain.document import DocumentStatus, Step
 from app.infrastructure.db.repositories import OrgScopedDocumentRepository
 from app.infrastructure.progress import asyncpg_dsn
 from tests.integration.conftest import requires_postgres
@@ -152,7 +153,9 @@ async def test_the_webhook_path_also_notifies(
     notifications.received.clear()
 
     async with database.system_session() as session:
-        await UnscopedDocumentRepository(session).complete(document.id)
+        await UnscopedDocumentRepository(session).record_outcome(
+            document.id, DocumentStatus.READY, None, datetime.now(UTC)
+        )
         await session.commit()
     await notifications.wait()
 

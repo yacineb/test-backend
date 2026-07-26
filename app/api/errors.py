@@ -7,6 +7,7 @@ from fastapi.responses import JSONResponse
 
 from app.domain.errors import (
     DocumentNotFound,
+    DocumentNotReady,
     EmptyUpload,
     InactiveUser,
     InvalidAccessToken,
@@ -38,6 +39,10 @@ _STATUS_BY_ERROR = {
     # Same reasoning as UnknownPartnerJob: a 403 here would confirm that
     # the document exists in some other tenant.
     DocumentNotFound: status.HTTP_404_NOT_FOUND,
+    # 409, not 404: the document is there and the caller may see it, but its
+    # extraction is not finished. A 404 would say the wrong thing to a client
+    # polling for data that is on its way.
+    DocumentNotReady: status.HTTP_409_CONFLICT,
     UploadTooLarge: status.HTTP_413_CONTENT_TOO_LARGE,
     EmptyUpload: status.HTTP_400_BAD_REQUEST,
     MissingFilename: status.HTTP_400_BAD_REQUEST,

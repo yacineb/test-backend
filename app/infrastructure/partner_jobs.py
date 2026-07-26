@@ -15,7 +15,6 @@ that comes back; nothing in the payload can name a tenant.
 from collections import deque
 
 from app.application.partner import is_duplicate, outcome_status
-from app.domain.document import DocumentStatus
 from app.domain.errors import UnknownPartnerJob
 from app.domain.partner import PartnerNotification
 from app.infrastructure.db.repositories import UnscopedDocumentRepository
@@ -39,10 +38,12 @@ class DbPartnerJobSink:
             if is_duplicate(document, notification):
                 return
 
-            if outcome_status(notification) is DocumentStatus.READY:
-                await documents.complete(document.id)
-            else:
-                await documents.fail(document.id)
+            await documents.record_outcome(
+                document.id,
+                outcome_status(notification),
+                notification.result,
+                notification.occurred_at,
+            )
 
             await session.commit()
 

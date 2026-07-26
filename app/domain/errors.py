@@ -93,3 +93,14 @@ class DocumentNotFound(DomainError):
     Deliberately not distinguished from "exists but belongs to someone else":
     telling those apart is a cross-tenant existence oracle.
     """
+
+
+class DocumentNotReady(DomainError):
+    """The document exists, but its extraction has not finished.
+
+    Carries the current status, so the caller learns what it is waiting for
+    instead of being told only that it cannot have the data.
+    """
+
+    def __init__(self, status: str) -> None:
+        super().__init__(f"no extracted data yet: the document is {status}")

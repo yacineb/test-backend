@@ -21,13 +21,15 @@ from app.api.schemas import (
     DocumentPageResponse,
     DocumentResponse,
     DocumentSummaryResponse,
+    ExtractedDataResponse,
     UploaderResponse,
     to_detail,
+    to_extracted_data,
 )
 from app.application.upload_document import upload_document
 from app.config import Settings
-from app.domain.document import Document, DocumentSummary
-from app.domain.errors import DocumentNotFound
+from app.domain.document import Document, DocumentStatus, DocumentSummary
+from app.domain.errors import DocumentNotFound, DocumentNotReady
 from app.infrastructure.progress import ProgressHub
 
 router = APIRouter(prefix="/documents", tags=["documents"])
@@ -153,6 +155,38 @@ async def get_document(
     if document is None:
         raise DocumentNotFound(f"no document {document_id}")
     return to_detail(document)
+
+
+@router.get(
+    "/{document_id}/data",
+    summary="The data extracted from one document",
+    description=(
+        "Available once the document is `ready` — that is, once the pipeline "
+        "has run *and* the partner's signed webhook has arrived. Before then "
+        "the answer is `409` naming the current status; poll "
+        "`GET /documents/{document_id}` or the event stream to know when to "
+        "come back.\n\n"
+        "`ocr` and `chunks` are projections (`chars` and a preview, a chunk "
+        "count) rather than the payloads themselves: the full text and the "
+        "chunk list are megabytes and belong in object storage, not in a "
+        "column read on every request."
+    ),
+    responses={
+        404: {"description": "No such document in this organization"},
+        409: {"description": "The document's extraction has not finished"},
+    },
+)
+async def get_extracted_data(
+    document_id: UUID,
+    ctx: CurrentUser,
+    documents: DocumentRepositoryDep,
+) -> ExtractedDataResponse:
+    document = await documents.get(document_id)
+    if document is None:
+        raise DocumentNotFound(f"no document {document_id}")
+    if document.status is not DocumentStatus.READY:
+        raise DocumentNotReady(document.status.value)
+    return to_extracted_data(document)
 
 
 def _sse(event: str, event_id: int, data: str) -> str:

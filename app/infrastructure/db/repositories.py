@@ -81,6 +81,8 @@ def _to_document(row: DocumentRow, steps: Sequence[DocumentStepRow] = ()) -> Doc
         created_at=row.created_at,
         workflow_id=row.workflow_id,
         partner_job_id=row.partner_job_id,
+        partner_result=row.partner_result,
+        partner_occurred_at=row.partner_occurred_at,
         failed_step=Step(row.failed_step) if row.failed_step else None,
         steps=tuple(sorted((_to_step(s) for s in steps), key=lambda s: order[s.step])),
     )
@@ -423,16 +425,28 @@ class UnscopedDocumentRepository:
         )
         return _to_document(row) if row else None
 
-    async def complete(self, document_id: UUID) -> None:
-        await self._session.execute(
-            update(DocumentRow)
-            .where(DocumentRow.id == document_id)
-            .values(status=DocumentStatus.READY)
-        )
+    async def record_outcome(
+        self,
+        document_id: UUID,
+        status: DocumentStatus,
+        result: dict | None,
+        occurred_at: datetime,
+    ) -> None:
+        """Apply the partner's answer: the status it implies, and its payload.
 
-    async def fail(self, document_id: UUID) -> None:
+        One statement for both outcomes, because they differ only in the status
+        written. The payload is stored either way - a failure's `result` is the
+        only account of why the partner refused the document.
+        """
         await self._session.execute(
             update(DocumentRow)
             .where(DocumentRow.id == document_id)
-            .values(status=DocumentStatus.FAILED, failed_step=Step.EXTERNAL_CALL)
+            .values(
+                status=status,
+                partner_result=result,
+                partner_occurred_at=occurred_at,
+                failed_step=(
+                    Step.EXTERNAL_CALL if status is DocumentStatus.FAILED else None
+                ),
+            )
         )

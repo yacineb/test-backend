@@ -119,6 +119,13 @@ class DocumentRow(Base):
     # The partner's only join key. Unique so a duplicate notification can never
     # resolve to two documents.
     partner_job_id: Mapped[str | None] = mapped_column(String(128), unique=True)
+    # The partner's payload, kept as it arrived: its shape is theirs.
+    partner_result: Mapped[dict | None] = mapped_column(JSONB)
+    # From inside the signed body, so it is the partner's event time rather
+    # than the moment we happened to receive it.
+    partner_occurred_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
     failed_step: Mapped[str | None] = mapped_column(String(32))
 
     # Serves the only list query there is: one org's documents, newest first.

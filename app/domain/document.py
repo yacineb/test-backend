@@ -83,6 +83,12 @@ class Document:
     # nothing about our tenants.
     workflow_id: str | None = None
     partner_job_id: str | None = None
+    # The partner's own payload, and the event time it signed. Both arrive with
+    # the notification that makes the document ready, so they live next to the
+    # job_id they answer rather than in a step's output: the outcome is what
+    # decides `status`, and one UPDATE writes all three.
+    partner_result: dict[str, Any] | None = None
+    partner_occurred_at: datetime | None = None
     failed_step: Step | None = None
     steps: tuple[DocumentStep, ...] = field(default=())
 

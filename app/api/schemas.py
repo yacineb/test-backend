@@ -137,6 +137,59 @@ class DocumentDetailResponse(DocumentResponse):
     steps: list[StepView]
 
 
+class PartnerOutcome(BaseModel):
+    """What the partner said, and which job it said it about."""
+
+    job_id: str
+    # Whatever the partner chose to send. Stored and returned as it arrived:
+    # its shape is theirs, and inventing a schema for it here would break the
+    # day they add a field.
+    result: dict[str, Any] | None = None
+    # The partner-side event time, from inside the signed body - not the moment
+    # we happened to receive it.
+    occurred_at: datetime
+
+
+class ExtractedDataResponse(BaseModel):
+    """Everything the pipeline extracted, once the document is `ready`.
+
+    One key per step, carrying that step's own output. `ocr` and `chunks` are
+    projections rather than payloads - `{"chars": n, "preview": …}` and
+    `{"count": n}` - because the full text and the chunk list are megabytes
+    that belong in object storage, not in a jsonb column read on every request.
+    """
+
+    document_id: UUID
+    status: str
+    ocr: dict[str, Any] | None = None
+    metadata: dict[str, Any] | None = None
+    chunks: dict[str, Any] | None = None
+    partner: PartnerOutcome | None = None
+
+
+def to_extracted_data(document: Document) -> ExtractedDataResponse:
+    outputs = {step.step: step.output for step in document.steps}
+    return ExtractedDataResponse(
+        document_id=document.id,
+        status=document.status.value,
+        ocr=outputs.get(Step.OCR),
+        metadata=outputs.get(Step.METADATA),
+        chunks=outputs.get(Step.CHUNKING),
+        # A ready document always has one, since ready is reachable only
+        # through the webhook. The branch is here because the column is
+        # nullable for every document that has not got there yet.
+        partner=(
+            PartnerOutcome(
+                job_id=document.partner_job_id,
+                result=document.partner_result,
+                occurred_at=document.partner_occurred_at,
+            )
+            if document.partner_job_id and document.partner_occurred_at
+            else None
+        ),
+    )
+
+
 def to_detail(document: Document) -> DocumentDetailResponse:
     return DocumentDetailResponse(
         id=document.id,

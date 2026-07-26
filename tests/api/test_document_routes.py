@@ -15,8 +15,15 @@ from fastapi.testclient import TestClient
 
 from app.api.deps import get_document_repository, get_token_service, get_upload_deps
 from app.domain.auth import AuthContext
+from app.domain.document import Document, DocumentStatus, DocumentStep, Step, StepStatus
 from app.main import app
-from tests.fakes import make_token_service, make_upload_deps, make_user, pdf_bytes
+from tests.fakes import (
+    make_document,
+    make_token_service,
+    make_upload_deps,
+    make_user,
+    pdf_bytes,
+)
 
 ORG = uuid4()
 OTHER_ORG = uuid4()
@@ -335,6 +342,112 @@ def test_offset_is_gone(client):
     page = client.get("/documents", headers=auth(), params={"offset": 1}).json()
 
     assert filenames(page) == ["second.pdf", "first.pdf"]
+
+
+JOB = "j_abc123def4567890"
+OCCURRED_AT = datetime(2026, 5, 21, 14, 23, 11, tzinfo=UTC)
+
+
+def processed(status: DocumentStatus, **overrides) -> Document:
+    """A document that has been through the pipeline, as the projection leaves it."""
+    document = make_document(ORG, status=status, partner_job_id=JOB)
+    outputs = {
+        Step.OCR: {"chars": 14, "preview": "lorem ipsum..."},
+        Step.METADATA: {"doc_type": "fake_type"},
+        Step.CHUNKING: {"count": 3},
+        Step.EXTERNAL_CALL: {"partner_job_id": JOB},
+    }
+    return replace(
+        document,
+        uploaded_by=USER,
+        steps=tuple(
+            DocumentStep(
+                step=step,
+                status=StepStatus.SUCCEEDED,
+                attempts=1,
+                last_error=None,
+                output=output,
+                started_at=document.created_at,
+                ended_at=document.created_at,
+            )
+            for step, output in outputs.items()
+        ),
+        **overrides,
+    )
+
+
+def test_extracted_data_requires_a_token(client, wiring):
+    _, documents, _ = wiring
+    document = processed(DocumentStatus.READY)
+    documents.documents.append(document)
+
+    assert client.get(f"/documents/{document.id}/data").status_code == 401
+
+
+def test_extracted_data_of_an_unknown_document_is_a_404(client):
+    response = client.get(f"/documents/{uuid4()}/data", headers=auth())
+
+    assert response.status_code == 404
+
+
+def test_extracted_data_is_returned_once_the_document_is_ready(client, wiring):
+    _, documents, _ = wiring
+    document = processed(
+        DocumentStatus.READY,
+        partner_result={"indexed_at": "2026-05-21T14:23:11Z"},
+        partner_occurred_at=OCCURRED_AT,
+    )
+    documents.documents.append(document)
+
+    response = client.get(f"/documents/{document.id}/data", headers=auth())
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "document_id": str(document.id),
+        "status": "ready",
+        "ocr": {"chars": 14, "preview": "lorem ipsum..."},
+        "metadata": {"doc_type": "fake_type"},
+        "chunks": {"count": 3},
+        "partner": {
+            "job_id": JOB,
+            "result": {"indexed_at": "2026-05-21T14:23:11Z"},
+            "occurred_at": "2026-05-21T14:23:11Z",
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        DocumentStatus.UPLOADED,
+        DocumentStatus.PROCESSING,
+        # The pipeline is done but the partner has not answered, so the
+        # extraction is not finished either.
+        DocumentStatus.AWAITING_PARTNER,
+    ],
+)
+def test_extracted_data_before_the_document_is_ready_is_a_409(client, wiring, status):
+    _, documents, _ = wiring
+    document = processed(status)
+    documents.documents.append(document)
+
+    response = client.get(f"/documents/{document.id}/data", headers=auth())
+
+    assert response.status_code == 409
+    # The client is told what to wait for rather than just refused.
+    assert status.value in response.json()["detail"]
+
+
+def test_extracted_data_of_a_failed_document_is_a_409(client, wiring):
+    """Terminal, but there is nothing to hand back: the status endpoint is
+    where a failure explains itself."""
+    _, documents, _ = wiring
+    document = processed(DocumentStatus.FAILED)
+    documents.documents.append(document)
+
+    response = client.get(f"/documents/{document.id}/data", headers=auth())
+
+    assert response.status_code == 409
 
 
 def test_upload_appears_in_the_openapi_schema_as_secured(client):
