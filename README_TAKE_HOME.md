@@ -131,17 +131,18 @@ test sont dans [CONTRIBUTING.md](CONTRIBUTING.md).
 **Lisez la première ligne.** C'est l'argumentaire complet du rendu, et il pointe
 vers le reste là où vous voudrez creuser une affirmation précise. Les six autres
 sont de la profondeur à la demande — mesures, plans de requête, contrats — pas
-une file d'attente à écouler. Les sept ensemble : environ 75 minutes.
+une file d'attente à écouler. Les sept ensemble : environ 82 minutes en lecture
+attentive, moitié moins en survol.
 
 | Document | La question à laquelle il répond | ~min |
 |---|---|---|
-| **[decisions-et-limites.md](docs/decisions-et-limites.md)** | **Chaque choix défendu face aux cibles de scale ; ce qui n'est volontairement pas construit et ce qui forcerait à le faire ; la suite, dans l'ordre** | **28** |
-| [orchestration.md](docs/orchestration.md) | Pourquoi DBOS plutôt que Temporal, Restate, Celery ou une file maison — et pourquoi le débit ne pouvait pas trancher | 5 |
-| [architecture-upload.md](docs/architecture-upload.md) | La table `documents`, le contrat de stockage, pourquoi la limite de taille est appliquée deux fois, d'où vient le tenant | 13 |
-| [liste-documents.md](docs/liste-documents.md) | Pagination keyset mesurée sur 2M lignes, ce que contient le curseur, pourquoi cet endpoint devrait finir en GraphQL | 8 |
-| [pipeline.md](docs/pipeline.md) | Le DAG, la politique de retry mesurée, la projection, et comment la progression arrive au client en ~80 ms | 10 |
-| [webhook-entrant.md](docs/webhook-entrant.md) | Signature sur les octets bruts, fenêtre anti-rejeu, codes de statut, idempotence | 4 |
-| [observabilite.md](docs/observabilite.md) | Niveaux de log, clés de corrélation, ce qui n'est jamais loggé | 4 |
+| **[decisions-et-limites.md](docs/decisions-et-limites.md)** | **Chaque choix défendu face aux cibles de scale ; ce qui n'est volontairement pas construit et ce qui forcerait à le faire ; la suite, dans l'ordre** | **24** |
+| [orchestration.md](docs/orchestration.md) | Pourquoi DBOS plutôt que Temporal, Restate, Celery ou une file maison — et pourquoi le débit ne pouvait pas trancher | 7 |
+| [architecture-upload.md](docs/architecture-upload.md) | La table `documents`, le contrat de stockage, pourquoi la limite de taille est appliquée deux fois, d'où vient le tenant | 15 |
+| [liste-documents.md](docs/liste-documents.md) | Pagination keyset mesurée sur 2M lignes, ce que contient le curseur, pourquoi cet endpoint devrait finir en GraphQL | 11 |
+| [pipeline.md](docs/pipeline.md) | Le DAG, la politique de retry mesurée, la projection, et comment la progression arrive au client en ~80 ms | 12 |
+| [webhook-entrant.md](docs/webhook-entrant.md) | Signature sur les octets bruts, fenêtre anti-rejeu, codes de statut, idempotence | 6 |
+| [observabilite.md](docs/observabilite.md) | Niveaux de log, clés de corrélation, ce qui n'est jamais loggé | 6 |
 
 ## Ce qui est vérifié
 

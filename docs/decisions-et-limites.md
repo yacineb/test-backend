@@ -163,182 +163,43 @@ workflow avec état et un point de suspension externe.
   pipeline. Les quatre déclencheurs qui le justifieraient sont dans
   [orchestration.md §4](orchestration.md), et aucun n'est un chiffre de volume.
 
-## 3. Le reste de l'architecture, défendu
+## 3. Le reste de l'architecture, en renvois
 
-**Tenancy**
+Chaque domaine est défendu, avec ses mesures, dans le document qui lui est
+consacré. Ce tableau est là pour y aller directement.
 
-- **`org_id` n'est jamais un paramètre.** Il vient du token d'accès vérifié :
-  « uploader chez un autre tenant » n'est pas une requête qu'on *refuse*, c'est
-  une requête qu'on ne peut pas *exprimer*.
-- **Et il tient ensuite à quatre niveaux indépendants** : le cas d'usage en
-  dérive la clé de stockage, le repository est construit scopé à
-  l'organisation, la session épingle `app.current_org_id` par transaction, et
-  Postgres applique la politique en `USING` *et* `WITH CHECK`. Les niveaux 1–2
-  sont du code applicatif et peuvent porter un bug ; les niveaux 3–4 tiennent
-  quand même.
-- **Le rôle applicatif n'a pas `BYPASSRLS`.** Un rôle séparé `app_auth` le
-  détient, utilisé uniquement là où aucun tenant n'est encore connu : recherche
-  d'utilisateur par email au login, refresh token par hash, et le sink partenaire
-  qui résout un `job_id` opaque. Du moindre privilège en tant que `GRANT`, pas en
-  tant que convention.
-- **Les tests d'intégration assertent via du SQL volontairement non filtré**,
-  donc une suite verte prouve que Postgres fait un travail indépendant plutôt que
-  le `WHERE` faisant tout le travail ([architecture-upload.md §5](architecture-upload.md)).
+| Sujet | Où c'est argumenté |
+|---|---|
+| Tenant issu du token, les quatre niveaux, `app_rw` sans `BYPASSRLS`, preuves RLS par SQL non filtré | [architecture-upload.md §5](architecture-upload.md) |
+| Octets avant la ligne, `storage_key` serveur, contrat `ObjectStore`, double plafond de taille, PDF décidé sur les octets | [architecture-upload.md §1–§4, §6](architecture-upload.md) |
+| Page comme position, curseur `(created_at, id)` opaque et non signé, index, jointure uploader | [liste-documents.md §2–§4](liste-documents.md) |
+| Projection à sens unique, quatre lignes de step dès la création, politique de retry mesurée, trigger `NOTIFY` et SSE | [pipeline.md](pipeline.md) |
+| HMAC sur les octets bruts vérifié avant parsing, fenêtre de fraîcheur, idempotence du sink | [webhook-entrant.md](webhook-entrant.md) |
+| Clés de corrélation, niveaux de log, ce qui n'est jamais loggé | [observabilite.md](observabilite.md) |
 
-**Upload**
+Quatre choix n'ont pas de document dédié et tiennent en quatre points :
 
-- **Les octets sont commités avant l'insertion de la ligne**, ce qui donne un
-  invariant total — toute ligne référence un objet complet — au lieu de deux
-  faits que chaque futur lecteur devrait réconcilier. Le coût est un blob
-  orphelin (L5), c'est-à-dire une facture de stockage ; le coût de l'alternative
-  est un chemin de lecture corrompu.
-- **`storage_key` est générée côté serveur (`{org_id}/{document_id}`)**, donc
-  aucune chaîne contrôlée par le client n'atteint un chemin. Ça ne s'ajoute pas à
-  l'assainissement du nom de fichier, ça le remplace : il n'y a nulle part où
-  mettre l'entrée d'un attaquant. Le préfixe `org_id` est aussi la frontière
-  qu'utiliseraient les règles de cycle de vie S3, les policies de bucket et une
-  clé KMS par tenant.
-- **`ObjectStore` a trois méthodes et une garantie** — une clé existe complète ou
-  n'existe pas — parce que c'est l'intersection honnête entre un répertoire POSIX
-  et un object store. `put` possède write-commit-abort au lieu de rendre un
-  handle de fichier, car une interface à handle n'a aucune implémentation S3
-  correcte ([architecture-upload.md §2](architecture-upload.md)).
-- **Les PDF sont décidés sur les octets de tête, jamais sur le `Content-Type`.**
-  Un en-tête de requête est une affirmation de la partie qu'on cherche à valider.
-  Le cas d'usage ne prend aucun argument `content_type` : il n'existe aucun
-  chemin par lequel l'affirmation du client atteindrait la décision.
-- **La limite de taille est appliquée deux fois, exprès.** `UploadFile` spoule le
-  corps avant l'exécution du handler, donc une limite posée dans le handler n'est
-  pas une limite : un client streamant 10 Go les aurait tous écrits dans le
-  répertoire temporaire avant la première ligne de code applicatif. Mesuré :
-  1,5 ms pour refuser au middleware, 130 ms au cas d'usage — c'est tout l'intérêt
-  du découpage ([architecture-upload.md §4](architecture-upload.md)).
-
-**Liste**
-
-- **Une page est une position.** Les pages en offset sont définies
-  sur une liste qui bouge, et sur une liste triée du plus récent au plus ancien,
-  dans un système dont la raison d'être est d'ingérer des documents, l'insertion
-  en tête est le régime permanent, pas un cas limite. Mesuré : 168 ms → 0,33 ms à
-  100 000 lignes de profondeur, avec un nombre de lignes lues constant à 51 quelle
-  que soit la profondeur.
-- **Le curseur est `(created_at, id)`** parce que `created_at` seul n'est pas
-  unique, et qu'un curseur incapable de départager une égalité soit répète des
-  lignes soit en saute — silencieusement, dans les deux cas.
-- **Le curseur est opaque et non signé.** Opaque parce qu'un curseur lisible
-  devient une API publique et que la clé de tri doit rester changeable ; non signé
-  parce qu'il ne porte aucune autorité — l'organisation vient du token et est
-  réappliquée par RLS, donc un curseur forgé permet au mieux de démarrer sa
-  *propre* liste où l'on veut ([liste-documents.md §3](liste-documents.md)).
-- **Une ligne de liste est un `DocumentSummary`, pas un `Document`**, avec
-  l'uploader embarqué par jointure, pour qu'aucun client ne soit poussé vers un
-  N+1 juste pour afficher un nom.
-
-**Pipeline et webhook**
-
-- **La projection est un modèle de lecture, à sens unique.** DBOS possède ses
-  checkpoints ; nous possédons `documents` et `document_steps` et ne lisons jamais
-  le schéma du moteur. La duplication est directionnelle, et c'est ce qui la
-  distingue du problème des deux sources de vérité que crée un broker.
-- **Les quatre lignes de step existent dès la création**, donc « pas démarré » est
-  une ligne à `status=pending` et non une ligne absente : rien en aval n'a de cas
-  particulier pour la progression partielle.
-- **La politique de retry est mesurée, pas choisie** : 5 tentatives, backoff
-  1/2/4/8s. Le défaut de DBOS abandonnerait 14 % des documents et l'absence de
-  retry 80 % ; un backoff de base 5s pousse à lui seul le p99 au-delà des 120s
-  ([pipeline.md](pipeline.md)).
-- **Le HMAC du webhook couvre les octets bruts et est vérifié avant le
-  parsing.** Re-sérialiser un modèle parsé change les espaces et l'ordre des
-  clés : ça échouerait sur des requêtes valides et inviterait quelqu'un à
-  « corriger » en relâchant le contrôle. La vérification est une dépendance, pas
-  les premières lignes du handler, donc une requête non signée est un `401` et le
-  parser ne tourne jamais.
-- **La fraîcheur est distincte de l'authenticité.** Une requête valide capturée
-  reste valide pour toujours, donc `occurred_at` est dans le payload signé et
-  contrôlé contre une fenêtre de tolérance dans les deux sens.
-- **Le partenaire ne nomme aucun tenant**, donc la résolution passe par la session
-  système et l'organisation est *dérivée* de la ligne portant le `job_id` — le même
-  raisonnement qui met « trouver un utilisateur par email » hors RLS au login.
-
-**Surface HTTP**
-
-- **Les en-têtes de sécurité viennent d'une bibliothèque, pas de chaînes écrites
-  à la main.** `SecurityHeadersMiddleware` applique le preset `STRICT` de
-  [`secure`](https://github.com/TypeError/secure) à toutes les réponses, y
-  compris celles produites par d'autres middlewares.
-- **Seule la CSP est choisie localement, indexée sur le `Content-Type` de la
-  réponse et non sur une liste de chemins.** Le JSON reçoit `default-src 'none'`
-  — un corps JSON n'affiche rien, il ne doit donc rien pouvoir charger. Le HTML
-  (`/docs`, `/redoc`) reçoit une politique autorisant exactement les hôtes CDN,
-  polices et favicon que chargent les pages de docs FastAPI.
-  `tests/api/test_security_headers.py` parse le vrai HTML des docs et asserte que
-  chaque asset externe référencé est autorisé par la CSP réellement servie —
-  sinon une CSP stricte blanchit Swagger tout en renvoyant `200`.
+- **Les en-têtes de sécurité viennent d'une bibliothèque**, pas de chaînes
+  écrites à la main : `SecurityHeadersMiddleware` applique le preset `STRICT` de
+  [`secure`](https://github.com/TypeError/secure) à toutes les réponses. Seule la
+  CSP est choisie localement, **indexée sur le `Content-Type` de la réponse et
+  non sur une liste de chemins** — le JSON reçoit `default-src 'none'` puisqu'un
+  corps JSON n'affiche rien, le HTML de `/docs` reçoit exactement les hôtes que
+  chargent les pages FastAPI. `tests/api/test_security_headers.py` parse le vrai
+  HTML des docs et asserte que chaque asset référencé est autorisé par la CSP
+  servie, sinon une CSP stricte blanchit Swagger tout en renvoyant `200`.
 - **L'auth est une dépendance, pas un middleware**, donc elle reste hors de
   `/health` et apparaît dans le schéma OpenAPI, où un relecteur voit quelles
   routes sont protégées.
-- **Les refresh tokens sont opaques, stockés en SHA-256, tournés à chaque usage ;
-  rejouer un token consommé révoque toute la famille.** Détecter le vol est le
-  but — et la révocation doit survivre à l'exception levée juste après, d'où un
-  `UnitOfWork.commit` explicite plutôt qu'implicite.
-
-**Transport temps réel**
-
-- **Postgres est le broker, parce que la source d'événements existait déjà.**
-  Chaque changement de statut est une écriture dans `document_steps` : un trigger
-  en fait un `NOTIFY`. Pas de file, pas de bus, pas de seconde source de vérité,
-  et rien d'ajouté à `compose.yaml`. Mesuré à ~80 ms entre le changement de
-  statut et le client connecté, pour une exigence « de l'ordre de la seconde ».
-- **Un trigger plutôt que du code applicatif**, pour deux raisons qui ne sont pas
-  stylistiques : `NOTIFY` est transactionnel, donc un listener n'est jamais averti
-  d'une ligne annulée ou qu'il ne pourrait pas lire ; et il couvre tous les
-  chemins d'écriture par construction, y compris le webhook partenaire qui passe
-  `ready` via un autre repository sur la session système — exactement le chemin
-  qu'une notification applicative oublie.
-- **Le payload n'est qu'un id de document.** Les abonnés relisent la projection
-  via leur propre session RLS, ce qui rend inoffensives les notifications
-  dupliquées, coalescées ou désordonnées, supprime la limite de 8000 octets comme
-  contrainte de conception, et garde toute donnée tenant hors d'un canal que tous
-  les processus écoutent.
-- **Une connexion `LISTEN` par processus, fan-out en mémoire**, donc 5 000
-  watchers coûtent 5 000 sockets et une connexion base.
-- **SSE plutôt que WebSocket.** Le trafic est unidirectionnel, la reconnexion est
-  une primitive du navigateur plutôt que du code applicatif, et c'est du HTTP
-  ordinaire à travers n'importe quel proxy.
-- **Le corps de l'événement est le même `DocumentDetailResponse` que renvoie
-  l'endpoint de polling**, donc les deux ne peuvent pas diverger, et un client
-  incapable de tenir un flux garde un repli fonctionnel.
-
-**Logs**
-
-- **Le code applicatif utilise la stdlib ; structlog est le rendu, configuré une
-  fois.** Aucune couche ne gagne de dépendance vers lui, donc `domain` et
-  `application` continuent de n'importer que la bibliothèque standard.
-- **Trois clés de corrélation, parce qu'une seule ne suffit plus dès que le
-  travail survit à la requête** : `request_id` pour la requête HTTP,
-  `org_id`/`user_id` après authentification, et `document_id`/`workflow_id` pour
-  les workers détachés dont les contextvars n'héritent pas de la requête.
-- **Un `X-Request-Id` entrant est respecté mais assaini**, parce qu'il est
-  contrôlé par l'appelant et atterrit dans chaque ligne de log de la requête —
-  le chemin classique d'injection de logs.
-- **Les erreurs client sont en WARNING, pas en ERROR.** Un utilisateur qui
-  uploade un PNG, c'est l'API qui fonctionne ; alerter là-dessus est la façon
-  dont on apprend à ignorer les alertes. De même une *tentative* de step échouée
-  est WARNING, et seul l'épuisement des retries est ERROR
-  ([observabilite.md](observabilite.md)).
-
-**Structure du code**
-
-- **Les ports sont des `Protocol`, pas des ABC.** Les adaptateurs les satisfont
-  structurellement, donc l'infrastructure n'importe jamais le domaine pour en
-  hériter, et les tests écrivent leurs fakes à la main sans framework de mock.
-- **`app/domain` n'importe que la bibliothèque standard**, et les dépendances ne
-  pointent que vers l'intérieur. C'est ce qui fait de « changer d'object store »
-  et « changer d'orchestrateur » des modifications d'un fichier plutôt que des
-  refactorings.
-- **Chaque dépendance tierce est derrière un port** — `argon2`, `PyJWT`,
-  `puremagic`, l'object store — donc la couche applicative ne nomme jamais un
-  fournisseur.
+- **Les refresh tokens sont opaques, stockés en SHA-256, tournés à chaque
+  usage ; rejouer un token consommé révoque toute la famille.** Détecter le vol
+  est le but — et la révocation doit survivre à l'exception levée juste après,
+  d'où un `UnitOfWork.commit` explicite plutôt qu'implicite.
+- **Les ports sont des `Protocol`, pas des ABC**, et `app/domain` n'importe que
+  la bibliothèque standard. Les adaptateurs les satisfont structurellement :
+  l'infrastructure n'importe jamais le domaine pour en hériter, les tests
+  écrivent leurs fakes sans framework de mock, et « changer d'object store » ou
+  « changer d'orchestrateur » reste la modification d'un fichier.
 
 ## 4. Limites assumées
 
