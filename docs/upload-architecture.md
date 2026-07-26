@@ -257,6 +257,16 @@ Layer 1 is a resource guard with a fuzzy bound and a blunt failure. Layer 2 is a
 precise product rule with a good error message. Collapsing them into one check
 means either an imprecise product limit or an unprotected parser.
 
+Layer 1 is hand-written, and that is a deliberate answer to "use a library
+instead". There isn't one: no maintained PyPI package implements an ASGI
+request-body cap, uvicorn 0.51 exposes no body-size limit (`limit_concurrency`,
+`limit_max_requests` and `h11_max_incomplete_event_size` are all about something
+else), and Starlette ships only the `413` status constant. In production this
+belongs in the reverse proxy — nginx `client_max_body_size`, or the equivalent
+ingress annotation — and the middleware stays as the guarantee that holds when
+the app is run without one. The security *headers* are a library
+(`secure`), because there one exists and is maintained.
+
 The limit is configuration (`MAX_UPLOAD_BYTES`), not a constant — which is what
 makes the boundary genuinely testable. Tests set it to a small value and assert
 that *exactly* the limit succeeds and limit+1 fails. A hardcoded 100 MB would

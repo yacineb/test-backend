@@ -46,5 +46,8 @@ ENV PATH="/app/.venv/bin:$PATH" \
 
 EXPOSE 8000
 
+# --no-server-header: don't advertise the server software. It has to be set
+# here rather than in the security-headers middleware, because uvicorn appends
+# its banner after the ASGI app has already returned its headers.
 ENTRYPOINT ["/app/.venv/bin/python", "-m", "uvicorn", "app.main:app", \
-            "--host", "0.0.0.0", "--port", "8000"]
+            "--host", "0.0.0.0", "--port", "8000", "--no-server-header"]

@@ -12,6 +12,7 @@ dependencies = [
     "pydantic[email]>=2.10",
     "pyjwt>=2.10",
     "python-multipart>=0.0.20",
+    "secure>=2.0",
     "sqlalchemy[asyncio]>=2.0",
     "uvicorn[standard]>=0.32",
 ]

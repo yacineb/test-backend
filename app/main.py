@@ -8,6 +8,7 @@ from pydantic import BaseModel
 from app.api.errors import register_error_handlers
 from app.api.middleware import MaxBodySizeMiddleware
 from app.api.routers import auth, documents, me, webhooks
+from app.api.security_headers import SecurityHeadersMiddleware
 from app.config import get_settings
 from app.infrastructure.db.session import Database
 from app.infrastructure.storage.posix import PosixObjectStore
@@ -48,6 +49,9 @@ def create_app() -> FastAPI:
     app.add_middleware(
         MaxBodySizeMiddleware, max_bytes=get_settings().storage.max_body_bytes
     )
+    # Added last, so it wraps outermost and also decorates the 413 that
+    # MaxBodySizeMiddleware returns without ever reaching a route.
+    app.add_middleware(SecurityHeadersMiddleware)
     register_error_handlers(app)
     app.include_router(auth.router)
     app.include_router(me.router)

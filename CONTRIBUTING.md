@@ -128,6 +128,32 @@ Dependencies point inward only: `domain` imports nothing but the standard
 library, `application` imports `domain`, `infrastructure` implements the
 domain's ports, and `api` wires them together.
 
+## Security headers
+
+`SecurityHeadersMiddleware` (`app/api/security_headers.py`) applies the OWASP
+header set to every response, including ones produced by other middleware. The
+values come from [`secure`](https://github.com/TypeError/secure)'s `STRICT`
+preset rather than being written by hand, so they track that library rather than
+drifting with us.
+
+Only the Content-Security-Policy is chosen locally, keyed on the response's
+`Content-Type` rather than on a path list:
+
+- **JSON** (everything the API returns) gets `default-src 'none'` — a JSON body
+  renders nothing, so it should be able to load nothing.
+- **HTML** (`/docs`, `/redoc`) gets a policy permitting the jsdelivr CDN, Google
+  Fonts and the favicon host that FastAPI's docs pages load from, and drops
+  `Cross-Origin-Embedder-Policy`, whose `require-corp` value would block those
+  CDN assets.
+
+`tests/api/test_security_headers.py` parses the real docs HTML and asserts every
+external asset it references is permitted by the CSP actually served — a strict
+CSP otherwise blanks out Swagger while still returning `200`.
+
+The `Server` banner is suppressed by uvicorn's `--no-server-header` in the
+Dockerfile, not by the middleware: uvicorn appends its banner after the ASGI app
+has returned, so setting it in application code produces two `Server` headers.
+
 ## Document uploads
 
 `POST /documents` streams a multipart upload into an `ObjectStore` and records a
