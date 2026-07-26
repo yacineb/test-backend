@@ -82,11 +82,43 @@ class JwtSettings(BaseSettings):
         return timedelta(seconds=self.refresh_ttl_seconds)
 
 
+class PartnerWebhookSettings(BaseSettings):
+    """Inbound partner notifications: shared secret, replay window, dev helper."""
+
+    model_config = _ENV
+
+    # Shared out-of-band with the partner. Same rule as JWT_SECRET: the default
+    # exists so `docker compose up` works, not because it is a secret.
+    hmac_secret: SecretStr = Field(
+        default=SecretStr("dev-only-partner-secret-change-me"),
+        validation_alias="PARTNER_HMAC_SECRET",
+    )
+
+    # HMAC proves authenticity, not freshness: a captured body stays valid
+    # forever. occurred_at travels inside the signed payload, so refusing stale
+    # notifications closes the replay window. 0 disables the check.
+    tolerance_seconds: int = Field(
+        default=5 * 60, validation_alias="PARTNER_WEBHOOK_TOLERANCE_SECONDS"
+    )
+
+    # The signing helper is a forgery oracle: whoever can call it can sign
+    # anything. On by default so /docs is usable out of the box; turn it off
+    # wherever the secret is real.
+    signing_helper_enabled: bool = Field(
+        default=True, validation_alias="PARTNER_WEBHOOK_SIGNING_HELPER"
+    )
+
+    @property
+    def tolerance(self) -> timedelta:
+        return timedelta(seconds=self.tolerance_seconds)
+
+
 class Settings(BaseSettings):
     model_config = _ENV
 
     db: DatabaseSettings = Field(default_factory=DatabaseSettings)
     jwt: JwtSettings = Field(default_factory=JwtSettings)
+    partner: PartnerWebhookSettings = Field(default_factory=PartnerWebhookSettings)
 
     # Password given to every seeded user. Local convenience only, and it
     # belongs to neither section above.

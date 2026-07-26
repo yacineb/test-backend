@@ -9,6 +9,8 @@ from app.domain.errors import (
     InvalidCredentials,
     InvalidRefreshToken,
     RefreshTokenReused,
+    StaleWebhook,
+    UnknownPartnerJob,
 )
 
 _STATUS_BY_ERROR = {
@@ -17,6 +19,10 @@ _STATUS_BY_ERROR = {
     InvalidRefreshToken: status.HTTP_401_UNAUTHORIZED,
     RefreshTokenReused: status.HTTP_401_UNAUTHORIZED,
     InactiveUser: status.HTTP_403_FORBIDDEN,
+    # Retrying the same bytes will not help in either case: the timestamp is
+    # signed, and an unknown job_id is one we never issued.
+    StaleWebhook: status.HTTP_400_BAD_REQUEST,
+    UnknownPartnerJob: status.HTTP_404_NOT_FOUND,
 }
 
 

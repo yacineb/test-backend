@@ -10,6 +10,7 @@ from uuid import UUID
 
 from app.domain.auth import AuthContext, RefreshToken
 from app.domain.organization import Organization
+from app.domain.partner import PartnerNotification
 from app.domain.user import User
 
 
@@ -71,3 +72,14 @@ class RefreshTokenRepository(Protocol):
     async def consume(self, token_id: UUID, now: datetime) -> None: ...
 
     async def revoke_family(self, family_id: UUID, now: datetime) -> None: ...
+
+
+class PartnerJobSink(Protocol):
+    async def deliver(self, notification: PartnerNotification) -> None:
+        """Apply a verified partner outcome to the document holding job_id.
+
+        Raise UnknownPartnerJob when nothing is waiting on that job_id. Must be
+        idempotent: partners retry, so the same job_id will arrive twice and a
+        duplicate must not apply the outcome twice.
+        """
+        ...

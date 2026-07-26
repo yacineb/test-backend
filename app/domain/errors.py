@@ -34,3 +34,15 @@ class RefreshTokenReused(AuthenticationError):
 
 class InvalidAccessToken(AuthenticationError):
     """Bearer token failed signature, expiry, or claim validation."""
+
+
+class WebhookError(DomainError):
+    """An inbound partner notification was rejected."""
+
+
+class StaleWebhook(WebhookError):
+    """occurred_at sits outside the accepted replay window."""
+
+
+class UnknownPartnerJob(WebhookError):
+    """No document is waiting on that job_id."""

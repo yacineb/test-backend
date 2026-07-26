@@ -12,6 +12,11 @@ x-app-env: &app-env
   JWT_ACCESS_TTL_SECONDS: "21600" # 6h
   JWT_REFRESH_TTL_SECONDS: "2592000" # 30d
   SEED_PASSWORD: password123
+  # Shared with the external partner out of band. The signing helper below it
+  # is a forgery oracle and has no business running anywhere real.
+  PARTNER_HMAC_SECRET: dev-only-partner-secret-change-me
+  PARTNER_WEBHOOK_TOLERANCE_SECONDS: "300" # 5min replay window
+  PARTNER_WEBHOOK_SIGNING_HELPER: "true"
 
 services:
   db:

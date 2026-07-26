@@ -12,7 +12,9 @@ from uuid import UUID, uuid4
 
 from app.application.deps import AuthDeps
 from app.domain.auth import RefreshToken
+from app.domain.errors import UnknownPartnerJob
 from app.domain.organization import Organization
+from app.domain.partner import PartnerNotification
 from app.domain.user import User
 from app.infrastructure.security.jwt import PyJwtTokenService
 
@@ -100,6 +102,17 @@ class FakeUnitOfWork:
 
     async def commit(self) -> None:
         self.commits += 1
+
+
+class RejectingPartnerJobSink:
+    """A sink with nothing waiting on the job_id.
+
+    The in-memory sink in app/infrastructure accepts everything, so this is the
+    only way to exercise the contract the real sink owes once documents exist.
+    """
+
+    async def deliver(self, notification: PartnerNotification) -> None:
+        raise UnknownPartnerJob(f"no document waiting on {notification.job_id}")
 
 
 def make_token_service() -> PyJwtTokenService:

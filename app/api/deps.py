@@ -14,7 +14,7 @@ from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.application.deps import AuthDeps
+from app.application.deps import AuthDeps, WebhookDeps
 from app.config import Settings, get_settings
 from app.domain.auth import AuthContext
 from app.domain.errors import InvalidAccessToken
@@ -27,8 +27,10 @@ from app.infrastructure.db.repositories import (
     UnscopedUserRepository,
 )
 from app.infrastructure.db.session import Database
+from app.infrastructure.partner_jobs import InMemoryPartnerJobSink
 from app.infrastructure.security.hashing import Argon2PasswordHasher
 from app.infrastructure.security.jwt import PyJwtTokenService
+from app.infrastructure.security.signatures import HmacSha256Signer
 
 SettingsDep = Annotated[Settings, Depends(get_settings)]
 
@@ -138,3 +140,50 @@ UserRepositoryDep = Annotated[OrgScopedUserRepository, Depends(get_user_reposito
 OrganizationRepositoryDep = Annotated[
     OrgScopedOrganizationRepository, Depends(get_organization_repository)
 ]
+
+SIGNATURE_HEADER = "X-Partner-Signature"
+
+
+def get_webhook_signer(settings: SettingsDep) -> HmacSha256Signer:
+    return HmacSha256Signer(settings.partner.hmac_secret.get_secret_value())
+
+
+WebhookSignerDep = Annotated[HmacSha256Signer, Depends(get_webhook_signer)]
+
+
+async def verify_partner_signature(request: Request, signer: WebhookSignerDep) -> None:
+    """Gate the webhook on HMAC over the raw body, before anything parses it.
+
+    A dependency rather than the first lines of the handler: FastAPI solves
+    dependencies before it validates the body, so an unsigned request is a 401
+    and the parser never sees the payload. Reading the body here is free —
+    Starlette caches it, so the body parameter still resolves.
+
+    No WWW-Authenticate on the way out: this route is not part of the bearer
+    surface and the partner has no token to offer.
+    """
+    signature = request.headers.get(SIGNATURE_HEADER)
+    body = await request.body()
+    if signature is None or not signer.verify(body, signature):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"missing or invalid {SIGNATURE_HEADER}",
+        )
+
+
+@lru_cache
+def _partner_job_sink() -> InMemoryPartnerJobSink:
+    # Cached so the stub's memory survives between requests. Replaced wholesale
+    # when the pipeline lands; see app/infrastructure/partner_jobs.py.
+    return InMemoryPartnerJobSink()
+
+
+def get_webhook_deps(settings: SettingsDep) -> WebhookDeps:
+    return WebhookDeps(
+        sink=_partner_job_sink(),
+        clock=SystemClock(),
+        tolerance=settings.partner.tolerance,
+    )
+
+
+WebhookDepsDep = Annotated[WebhookDeps, Depends(get_webhook_deps)]

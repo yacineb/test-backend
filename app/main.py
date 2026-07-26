@@ -5,7 +5,7 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 
 from app.api.errors import register_error_handlers
-from app.api.routers import auth, me
+from app.api.routers import auth, me, webhooks
 from app.config import get_settings
 from app.infrastructure.db.session import Database
 
@@ -33,6 +33,7 @@ def create_app() -> FastAPI:
     register_error_handlers(app)
     app.include_router(auth.router)
     app.include_router(me.router)
+    app.include_router(webhooks.router)
 
     @app.get("/health", tags=["ops"], summary="Liveness probe")
     def health() -> Health:
