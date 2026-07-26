@@ -1,0 +1,578 @@
+# Décisions, limites assumées, et la suite
+
+Le rendu en un document : chaque choix d'architecture avec son argument, ce qui
+a été sciemment laissé de côté et ce qui forcerait à le faire, et l'ordre dans
+lequel la suite serait construite. Chaque choix pointe vers le document qui
+l'argumente en détail.
+
+## 0. Les chiffres face auxquels tout est défendu
+
+De l'énoncé : **aujourd'hui** ~1 000 documents/jour et ~50 utilisateurs
+concurrents ; **cible 12 mois** ~100 000 documents/jour, ~5 000 utilisateurs
+concurrents, p95 du pipeline sous 2 minutes.
+
+Dérivé de `scripts/simulate_pipeline.py` (200 000 pipelines simulés, modélisant
+exactement les mocks fournisseurs) :
+
+| | aujourd'hui | cible, journée 8h | cible, 8h + burst ×3 |
+|---|---|---|---|
+| documents/seconde | 0,012 | 3,47 | 10,42 |
+| exécutions de step/s (retries inclus) | 0,07 | 20,7 | 62,0 |
+| slots de step concurrents | 0,4 | 130 | 390 |
+| p95 pipeline | — | 56,9s pour un budget de 120s | |
+
+Côté upload, même histoire : 100 000/jour dont 80 % dans une fenêtre de 8 heures
+donnent **2,8 uploads/s**, soit à 2 Mo de PDF moyen 5,6 Mo/s ≈ 45 Mbit/s en
+pointe, avec environ 9 uploads en vol à tout instant.
+
+Tout ce qui suit est défendu face à ces nombres, et non seulement mon intuition.
+
+## 1. Postgres suffit largement
+
+- **La charge d'écriture est de quelques centaines de lignes par seconde en
+  pointe.** Un document coûte 1 ligne `documents` + 4 lignes `document_steps` à
+  la création, puis un début et une fin par exécution de step (5,9 en comptant
+  les retries), plus les checkpoints de DBOS. Disons ~30 petites écritures de
+  ligne par document → **~310 écritures/s au burst ×3**. Un nœud Postgres modeste
+  encaisse des milliers de petites transactions d'écriture par seconde. Il n'y a
+  pas de problème d'écriture à résoudre.
+- **La charge de file est de 62 claims/seconde.** `SELECT … FOR UPDATE SKIP
+  LOCKED` en soutient des milliers sur un nœud. C'est le chiffre pour lequel on
+  croit avoir besoin de Kafka ; il a besoin d'un index.
+- **Les lectures sont des parcours d'index, mesurés.** La liste est une page
+  keyset : 0,33–0,49 ms sur 2 000 031 documents dont 500 000 dans l'organisation
+  appelante, et le coût ne croît pas avec la profondeur de scroll
+  ([liste-documents.md §2](liste-documents.md)).
+- **Le volume reste petit parce que le gros payload n'y est délibérément pas.**
+  ~1,5 Ko de métadonnées par document → ~150 Mo/jour → ~55 Go/an. Inliner le
+  texte OCR au lieu d'une projection `{"chars": n, "preview": …}` donnerait ~10
+  Go/jour d'amplification d'écriture — d'où le preview en jsonb, le texte
+  complet restant dans le checkpoint (F6 le déplace vers l'object store).
+- **5 000 utilisateurs concurrents, ce n'est pas 5 000 connexions base.** C'est
+  un tier d'API poolé devant un pool. Le seul endroit où ce nombre aurait mordu,
+  c'est la progression : 5 000 watchers en polling 1 Hz font 5 000 lectures/s.
+  En push, les lectures suivent les *événements* (134/s au pic cible) et non
+  watchers × secondes — 37 à 112× moins de travail — pour une connexion `LISTEN`
+  par processus, pas par watcher.
+- **Donc la base n'est pas la contrainte. Les threads le sont** (L9), et
+  l'intervalle de polling de la file aussi (L10). Les deux sont nommés, et aucun
+  ne se règle en ajoutant de l'infrastructure.
+- **Un seul service stateful, c'est une sauvegarde, un failover, une procédure de
+  restauration, une chose à superviser, une chose qui réveille quelqu'un la
+  nuit.** À 0,07 job/seconde aujourd'hui, tout service stateful supplémentaire
+  coûte plus en exploitation qu'il ne rapporte en capacité.
+
+## 2. L'exécution durable *au-dessus de Postgres* est la bonne forme
+
+- **L'état du workflow et l'état du document doivent être d'accord, et ici ils
+  partagent le même domaine transactionnel.** L'orchestrateur checkpointe dans le
+  schéma `dbos` de la base où vit la projection. Rien à réconcilier à travers une
+  frontière réseau à l'endroit où se décide la correction.
+- **La reprise reprend, elle ne recommence pas.** Chaque sortie de step est
+  persistée à mesure, donc un worker tué repart au premier step incomplet. Avec
+  1,6 % de documents abandonnés à la cible — ~1 600/jour — pouvoir rejouer *à
+  partir* d'un historique par step est une exigence d'exploitation, pas un
+  confort.
+- **Le moteur est une bibliothèque, pas un cluster.** Aucun control plane à
+  faire tourner, mettre à jour, sécuriser ou payer. `compose.yaml` se résume à
+  `db → migrate → seed → api` ; DBOS migre ses propres tables au lancement.
+- **Le DAG est une constante, donc le bénéfice du replay est inutilisé.** Quatre
+  steps, forme fixe, pas de boucle, pas de branchement dynamique, pas d'état
+  accumulé en mémoire, et des sorties qui sont une chaîne, un dict, une liste de
+  chaînes et un id opaque. Choisir le replay déterministe (Temporal) reviendrait
+  à accepter les contraintes de déterminisme et le versioning de workflow en
+  échange d'un contrôle de flux durable arbitraire que ce pipeline n'a pas.
+  C'est ça l'argument de fond, pas « Temporal est lourd »
+  ([orchestration.md §2](orchestration.md)).
+- **Le point de suspension est réel, et c'est là que les files de tâches
+  s'arrêtent.** Le workflow se termine à `awaiting_partner` ; un partenaire qui
+  répond en heures se modélise par une colonne de statut et une clé de
+  corrélation unique — moins cher, et testable indépendamment.
+- **Le débit n'a pas tranché, et ne pouvait pas.** Tous les candidats passent les
+  62 exécutions de step/s avec deux ordres de grandeur de marge
+  ([orchestration.md §1](orchestration.md)).
+
+### Pourquoi Celery serait un mauvais choix ici
+
+Ce n'est pas un jugement de qualité — Celery est mature, largement exploité,
+facile à recruter. C'est la mauvaise *forme* : une file de tâches, là où on a un
+workflow avec état et un point de suspension externe.
+
+- **Il ajoute un second domaine de durabilité pour 0,07 job/seconde.** Le broker
+  porte l'état de la file, Postgres l'état du document, et rien ne les garde
+  cohérents : un worker qui acquitte au broker puis meurt avant de commiter a
+  menti. Corriger proprement veut dire enqueue-après-commit ou outbox
+  transactionnel — plus de machinerie que la file qu'on voulait s'épargner.
+- **Le broker est un service stateful que vous exploitez désormais.** Redis
+  n'est pas durable par défaut : rendez-le durable et vous opérez un second
+  service stateful, laissez-le tel quel et vous perdez des documents au
+  redémarrage. RabbitMQ est durable, et c'est un troisième conteneur.
+- **Le fan-out réclame un `chord`**, qui réclame un result backend, dont le
+  compteur de complétion vit dans le broker. L'interaction chord × retries est
+  un piège connu : une tâche rejouée dans le groupe peut laisser le chord
+  suspendu. Or `metadata` et `chunking` échouent une fois sur trois — ce n'est
+  pas le cas rare ici, c'est le cas courant.
+- **Celery rejoue une tâche, il ne reprend pas un workflow.** Si `external_call`
+  échoue après le succès de `metadata` et `chunking`, il n'y a aucun checkpoint
+  d'où repartir : ce qui est fini vit dans un compteur de broker. On finit par
+  écrire `document_steps` comme véritable machine à états — exactement ce pour
+  quoi on voulait un framework.
+- **La sémantique de crash impose un choix sans bon côté.** Par défaut
+  (`acks_late=False`) le message est acquitté à la livraison : un worker tué perd
+  le step silencieusement. Avec `acks_late=True` le message est re-livré, ce qui
+  exige des steps rejouables — et les fonctions fournisseurs ne sont
+  explicitement pas idempotentes. Bien le faire suppose un bail avec expiration
+  et une reprise sur état : reconstruire le checkpointing, à la main, mal.
+- **`awaiting_partner` n'a aucune place dedans.** Parker pendant des heures n'est
+  pas le métier d'une file de tâches ; la machine à états et le sweep de timeout
+  sont entièrement à votre charge.
+- **L'observabilité est en forme de tâche, pas de document.** Flower montre des
+  événements de tâche. Répondre à « où en est le document X, et pourquoi »
+  demande de corréler des logs.
+- **Contrepoint honnête :** pour une équipe qui exploite déjà Celery en
+  production, la plupart de ces objections portent sur *l'ajout* d'un broker
+  plutôt que sur la vie avec, et la familiarité vaut de l'argent. Cet argument ne
+  s'applique pas à un service greenfield.
+
+### Simplicité, robustesse, et migration path
+
+- **Peu de moving parts :** une base, une image applicative, zéro broker,
+  zéro cache, zéro service d'orchestration. Tout mode de panne est un mode de
+  panne Postgres, celui que toute l'équipe sait déjà diagnostiquer.
+- **La robustesse vient de la base, pas de la discipline applicative.**
+  L'isolation tenant est une politique RLS, donc une requête qui perd son `WHERE`
+  ne renvoie rien. L'atomicité d'un upload est un `rename(2)`. La cohérence de la
+  projection est une transaction. Rien de tout cela ne demande au relecteur de
+  faire confiance au code.
+- **Monter en charge ne demande pas de ré-architecturer d'abord.** Plus de
+  réplicas d'API, plus de concurrence worker, puis une base plus grosse, puis des
+  réplicas de lecture pour la liste. La file est déjà partitionnée par `org_id`,
+  donc l'import de 10 000 documents d'un tenant ne peut pas affamer l'upload
+  unique d'un autre.
+- **Opérer en managé sans changer une ligne.** DBOS Cloud, ou un Conductor
+  self-hosted, apporte l'UI de workflows, la rétention et l'observabilité par
+  dessus la même bibliothèque et les mêmes tables. C'est une décision de
+  déploiement, prise plus tard, à code constant.
+- **Changer carrément de moteur est borné, par construction.** Le modèle de
+  lecture exposé au tenant (`documents`, `document_steps`) est **le nôtre**,
+  écrit par les wrappers de step, jamais relu depuis le schéma du moteur. Le
+  contrat d'API, la projection, la politique de retry et les tests sont
+  indépendants du moteur ; les steps sont des fonctions async ordinaires à
+  frontières explicites. Porter vers Temporal ou Restate, c'est redécorer ces
+  frontières et recâbler un adaptateur `PipelineRunner` — pas réécrire le
+  pipeline. Les quatre déclencheurs qui le justifieraient sont dans
+  [orchestration.md §4](orchestration.md), et aucun n'est un chiffre de volume.
+
+## 3. Le reste de l'architecture, défendu
+
+**Tenancy**
+
+- **`org_id` n'est jamais un paramètre.** Il vient du token d'accès vérifié :
+  « uploader chez un autre tenant » n'est pas une requête qu'on *refuse*, c'est
+  une requête qu'on ne peut pas *exprimer*.
+- **Et il tient ensuite à quatre niveaux indépendants** : le cas d'usage en
+  dérive la clé de stockage, le repository est construit scopé à
+  l'organisation, la session épingle `app.current_org_id` par transaction, et
+  Postgres applique la politique en `USING` *et* `WITH CHECK`. Les niveaux 1–2
+  sont du code applicatif et peuvent porter un bug ; les niveaux 3–4 tiennent
+  quand même.
+- **Le rôle applicatif n'a pas `BYPASSRLS`.** Un rôle séparé `app_auth` le
+  détient, utilisé uniquement là où aucun tenant n'est encore connu : recherche
+  d'utilisateur par email au login, refresh token par hash, et le sink partenaire
+  qui résout un `job_id` opaque. Du moindre privilège en tant que `GRANT`, pas en
+  tant que convention.
+- **Les tests d'intégration assertent via du SQL volontairement non filtré**,
+  donc une suite verte prouve que Postgres fait un travail indépendant plutôt que
+  le `WHERE` faisant tout le travail ([architecture-upload.md §5](architecture-upload.md)).
+
+**Upload**
+
+- **Les octets sont commités avant l'insertion de la ligne**, ce qui donne un
+  invariant total — toute ligne référence un objet complet — au lieu de deux
+  faits que chaque futur lecteur devrait réconcilier. Le coût est un blob
+  orphelin (L5), c'est-à-dire une facture de stockage ; le coût de l'alternative
+  est un chemin de lecture corrompu.
+- **`storage_key` est générée côté serveur (`{org_id}/{document_id}`)**, donc
+  aucune chaîne contrôlée par le client n'atteint un chemin. Ça ne s'ajoute pas à
+  l'assainissement du nom de fichier, ça le remplace : il n'y a nulle part où
+  mettre l'entrée d'un attaquant. Le préfixe `org_id` est aussi la frontière
+  qu'utiliseraient les règles de cycle de vie S3, les policies de bucket et une
+  clé KMS par tenant.
+- **`ObjectStore` a trois méthodes et une garantie** — une clé existe complète ou
+  n'existe pas — parce que c'est l'intersection honnête entre un répertoire POSIX
+  et un object store. `put` possède write-commit-abort au lieu de rendre un
+  handle de fichier, car une interface à handle n'a aucune implémentation S3
+  correcte ([architecture-upload.md §2](architecture-upload.md)).
+- **Les PDF sont décidés sur les octets de tête, jamais sur le `Content-Type`.**
+  Un en-tête de requête est une affirmation de la partie qu'on cherche à valider.
+  Le cas d'usage ne prend aucun argument `content_type` : il n'existe aucun
+  chemin par lequel l'affirmation du client atteindrait la décision.
+- **La limite de taille est appliquée deux fois, exprès.** `UploadFile` spoule le
+  corps avant l'exécution du handler, donc une limite posée dans le handler n'est
+  pas une limite : un client streamant 10 Go les aurait tous écrits dans le
+  répertoire temporaire avant la première ligne de code applicatif. Mesuré :
+  1,5 ms pour refuser au middleware, 130 ms au cas d'usage — c'est tout l'intérêt
+  du découpage ([architecture-upload.md §4](architecture-upload.md)).
+
+**Liste**
+
+- **Une page est une position.** Les pages en offset sont définies
+  sur une liste qui bouge, et sur une liste triée du plus récent au plus ancien,
+  dans un système dont la raison d'être est d'ingérer des documents, l'insertion
+  en tête est le régime permanent, pas un cas limite. Mesuré : 168 ms → 0,33 ms à
+  100 000 lignes de profondeur, avec un nombre de lignes lues constant à 51 quelle
+  que soit la profondeur.
+- **Le curseur est `(created_at, id)`** parce que `created_at` seul n'est pas
+  unique, et qu'un curseur incapable de départager une égalité soit répète des
+  lignes soit en saute — silencieusement, dans les deux cas.
+- **Le curseur est opaque et non signé.** Opaque parce qu'un curseur lisible
+  devient une API publique et que la clé de tri doit rester changeable ; non signé
+  parce qu'il ne porte aucune autorité — l'organisation vient du token et est
+  réappliquée par RLS, donc un curseur forgé permet au mieux de démarrer sa
+  *propre* liste où l'on veut ([liste-documents.md §3](liste-documents.md)).
+- **Une ligne de liste est un `DocumentSummary`, pas un `Document`**, avec
+  l'uploader embarqué par jointure, pour qu'aucun client ne soit poussé vers un
+  N+1 juste pour afficher un nom.
+
+**Pipeline et webhook**
+
+- **La projection est un modèle de lecture, à sens unique.** DBOS possède ses
+  checkpoints ; nous possédons `documents` et `document_steps` et ne lisons jamais
+  le schéma du moteur. La duplication est directionnelle, et c'est ce qui la
+  distingue du problème des deux sources de vérité que crée un broker.
+- **Les quatre lignes de step existent dès la création**, donc « pas démarré » est
+  une ligne à `status=pending` et non une ligne absente : rien en aval n'a de cas
+  particulier pour la progression partielle.
+- **La politique de retry est mesurée, pas choisie** : 5 tentatives, backoff
+  1/2/4/8s. Le défaut de DBOS abandonnerait 14 % des documents et l'absence de
+  retry 80 % ; un backoff de base 5s pousse à lui seul le p99 au-delà des 120s
+  ([pipeline.md](pipeline.md)).
+- **Le HMAC du webhook couvre les octets bruts et est vérifié avant le
+  parsing.** Re-sérialiser un modèle parsé change les espaces et l'ordre des
+  clés : ça échouerait sur des requêtes valides et inviterait quelqu'un à
+  « corriger » en relâchant le contrôle. La vérification est une dépendance, pas
+  les premières lignes du handler, donc une requête non signée est un `401` et le
+  parser ne tourne jamais.
+- **La fraîcheur est distincte de l'authenticité.** Une requête valide capturée
+  reste valide pour toujours, donc `occurred_at` est dans le payload signé et
+  contrôlé contre une fenêtre de tolérance dans les deux sens.
+- **Le partenaire ne nomme aucun tenant**, donc la résolution passe par la session
+  système et l'organisation est *dérivée* de la ligne portant le `job_id` — le même
+  raisonnement qui met « trouver un utilisateur par email » hors RLS au login.
+
+**Surface HTTP**
+
+- **Les en-têtes de sécurité viennent d'une bibliothèque, pas de chaînes écrites
+  à la main.** `SecurityHeadersMiddleware` applique le preset `STRICT` de
+  [`secure`](https://github.com/TypeError/secure) à toutes les réponses, y
+  compris celles produites par d'autres middlewares.
+- **Seule la CSP est choisie localement, indexée sur le `Content-Type` de la
+  réponse et non sur une liste de chemins.** Le JSON reçoit `default-src 'none'`
+  — un corps JSON n'affiche rien, il ne doit donc rien pouvoir charger. Le HTML
+  (`/docs`, `/redoc`) reçoit une politique autorisant exactement les hôtes CDN,
+  polices et favicon que chargent les pages de docs FastAPI.
+  `tests/api/test_security_headers.py` parse le vrai HTML des docs et asserte que
+  chaque asset externe référencé est autorisé par la CSP réellement servie —
+  sinon une CSP stricte blanchit Swagger tout en renvoyant `200`.
+- **L'auth est une dépendance, pas un middleware**, donc elle reste hors de
+  `/health` et apparaît dans le schéma OpenAPI, où un relecteur voit quelles
+  routes sont protégées.
+- **Les refresh tokens sont opaques, stockés en SHA-256, tournés à chaque usage ;
+  rejouer un token consommé révoque toute la famille.** Détecter le vol est le
+  but — et la révocation doit survivre à l'exception levée juste après, d'où un
+  `UnitOfWork.commit` explicite plutôt qu'implicite.
+
+**Transport temps réel**
+
+- **Postgres est le broker, parce que la source d'événements existait déjà.**
+  Chaque changement de statut est une écriture dans `document_steps` : un trigger
+  en fait un `NOTIFY`. Pas de file, pas de bus, pas de seconde source de vérité,
+  et rien d'ajouté à `compose.yaml`. Mesuré à ~80 ms entre le changement de
+  statut et le client connecté, pour une exigence « de l'ordre de la seconde ».
+- **Un trigger plutôt que du code applicatif**, pour deux raisons qui ne sont pas
+  stylistiques : `NOTIFY` est transactionnel, donc un listener n'est jamais averti
+  d'une ligne annulée ou qu'il ne pourrait pas lire ; et il couvre tous les
+  chemins d'écriture par construction, y compris le webhook partenaire qui passe
+  `ready` via un autre repository sur la session système — exactement le chemin
+  qu'une notification applicative oublie.
+- **Le payload n'est qu'un id de document.** Les abonnés relisent la projection
+  via leur propre session RLS, ce qui rend inoffensives les notifications
+  dupliquées, coalescées ou désordonnées, supprime la limite de 8000 octets comme
+  contrainte de conception, et garde toute donnée tenant hors d'un canal que tous
+  les processus écoutent.
+- **Une connexion `LISTEN` par processus, fan-out en mémoire**, donc 5 000
+  watchers coûtent 5 000 sockets et une connexion base.
+- **SSE plutôt que WebSocket.** Le trafic est unidirectionnel, la reconnexion est
+  une primitive du navigateur plutôt que du code applicatif, et c'est du HTTP
+  ordinaire à travers n'importe quel proxy.
+- **Le corps de l'événement est le même `DocumentDetailResponse` que renvoie
+  l'endpoint de polling**, donc les deux ne peuvent pas diverger, et un client
+  incapable de tenir un flux garde un repli fonctionnel.
+
+**Logs**
+
+- **Le code applicatif utilise la stdlib ; structlog est le rendu, configuré une
+  fois.** Aucune couche ne gagne de dépendance vers lui, donc `domain` et
+  `application` continuent de n'importer que la bibliothèque standard.
+- **Trois clés de corrélation, parce qu'une seule ne suffit plus dès que le
+  travail survit à la requête** : `request_id` pour la requête HTTP,
+  `org_id`/`user_id` après authentification, et `document_id`/`workflow_id` pour
+  les workers détachés dont les contextvars n'héritent pas de la requête.
+- **Un `X-Request-Id` entrant est respecté mais assaini**, parce qu'il est
+  contrôlé par l'appelant et atterrit dans chaque ligne de log de la requête —
+  le chemin classique d'injection de logs.
+- **Les erreurs client sont en WARNING, pas en ERROR.** Un utilisateur qui
+  uploade un PNG, c'est l'API qui fonctionne ; alerter là-dessus est la façon
+  dont on apprend à ignorer les alertes. De même une *tentative* de step échouée
+  est WARNING, et seul l'épuisement des retries est ERROR
+  ([observabilite.md](observabilite.md)).
+
+**Structure du code**
+
+- **Les ports sont des `Protocol`, pas des ABC.** Les adaptateurs les satisfont
+  structurellement, donc l'infrastructure n'importe jamais le domaine pour en
+  hériter, et les tests écrivent leurs fakes à la main sans framework de mock.
+- **`app/domain` n'importe que la bibliothèque standard**, et les dépendances ne
+  pointent que vers l'intérieur. C'est ce qui fait de « changer d'object store »
+  et « changer d'orchestrateur » des modifications d'un fichier plutôt que des
+  refactorings.
+- **Chaque dépendance tierce est derrière un port** — `argon2`, `PyJWT`,
+  `puremagic`, l'object store — donc la couche applicative ne nomme jamais un
+  fournisseur.
+
+## 4. Limites assumées
+
+Chacune nomme la condition qui forcerait à la corriger : aucune n'est un
+« un jour ».
+
+**L1 — Les octets transitent par l'API au lieu d'aller directement au
+stockage.** 2,8 uploads/s ≈ 45 Mbit/s en pointe n'est pas une charge
+significative. *Déclencheur :* la taille moyenne des objets, pas le nombre de
+documents — à 100 Mo de moyenne, le même débit fait 2,2 Gbit/s et on ajoute des
+nœuds d'API pour pelleter des octets. `size_bytes` est enregistré à chaque
+upload : le déclencheur est mesurable dès aujourd'hui
+([architecture-upload.md §3](architecture-upload.md)).
+
+**L2 — L'object store est un répertoire POSIX sur un seul nœud.** Un volume
+compose ne survit pas à un second réplica d'API : deux nœuds, deux ensembles de
+fichiers disjoints. *Déclencheur :* tout déploiement à plus d'un nœud d'API,
+c'est-à-dire tout déploiement réel. D'où F1 en tête de liste.
+
+**L3 — Chaque upload est écrit deux fois sur le disque local.** Starlette spoule
+le corps multipart dans un fichier temporaire avant le handler, puis le store
+l'écrit de nouveau. Y remédier suppose de parser le multipart incrémentalement
+sur `request.stream()`, pour un gain aujourd'hui non mesurable.
+
+**L4 — Un upload rejoué crée un second document.** Pas d'`Idempotency-Key`. Non
+construit parce qu'aucun client ne rejoue automatiquement aujourd'hui.
+
+**L5 — Un crash entre le commit du stockage et l'`INSERT` laisse un blob
+orphelin.** Invisible pour tous les lecteurs, récupérable en diffant les clés
+contre la table. Aucun sweeper n'existe encore.
+
+**L6 — Un partenaire fantôme attend indéfiniment.** Si le webhook n'arrive
+jamais, le document reste en `awaiting_partner` sans rien pour l'en sortir. La
+requête de détection est `document_steps.ended_at` du step `external_call`,
+au-delà d'un seuil, document toujours en `awaiting_partner`.
+
+**L7 — Un crash entre l'acceptation par le partenaire et le commit du checkpoint
+produit un job en double.** À la reprise, `external_call` est réexécuté : le
+partenaire émet un second `job_id`, et le premier — jamais enregistré — répondra
+`404` pour toujours quand il rappellera. Inhérent à tout appel sortant non
+idempotent ; la correction est un job de réconciliation plus une clé
+d'idempotence sur la requête partenaire, pas un autre orchestrateur.
+
+**L8 — 1,6 % des documents sont abandonnés.** ~1 600/jour à la cible, sans deadletter table/queue ni endpoint de replay. Le checkpointing fait qu'un rejeu
+*reprendrait* au lieu de recommencer ; rien ne l'expose encore.
+
+**L9 — Chaque step en vol tient un thread OS**, parce que les mocks fournisseurs
+appellent un `time.sleep()` bloquant. ~0,4 step concurrent aujourd'hui, ~390 à la
+cible. Le sleep tient lieu d'E/S réseau : la correction est d'`await` de vrais
+appels HTTP quand les fournisseurs seront réels, pas d'ajouter des threads.
+
+**L10 — Les workers partagent le processus de l'API.** DBOS est lancé par un
+middleware dans `create_app` : les threads du pipeline et le traitement des
+requêtes se disputent un seul processus et ne se dimensionnent pas séparément.
+`PIPELINE_QUEUE_POLLING_INTERVAL_SECONDS` (défaut 1,0s) coûte par ailleurs deux
+fois par document, soit ~2s des ~63s de marge.
+
+**L11 — Le flux SSE couvre l'état, pas les transitions manquées pendant une
+coupure.** Chaque connexion s'ouvre sur un snapshot de l'état courant — c'est ce
+qui rend la reconnexion sans rejeu et le plafond de 5 minutes par connexion sûr
+plutôt que lossy — mais un client absent pendant un `running → succeeded →
+running` ne voit que le point d'arrivée. Sans conséquence pour une UI de
+progression qui affiche l'état courant ; faux pour tout ce qui a besoin du
+journal des transitions. *Correction si nécessaire :* Redis Streams ou un curseur
+`Last-Event-ID` sur une table d'événements retenus — deux stockages que ce design
+n'a délibérément pas.
+
+**L12 — L'`EventSource` du navigateur ne sait pas s'authentifier.** Il ne peut
+pas envoyer d'en-tête `Authorization`, donc une vraie UI demande un ticket de
+flux à courte durée de vie plutôt qu'un token en query string. Non construit :
+il n'y a pas d'UI, et inventer l'endpoint maintenant serait spéculatif.
+
+**L13 — L'auth est faite maison, et ce n'est pas une cible de production.**
+Émission et validation de JWT, rotation des refresh et révocation de famille sont
+implémentées ici pour que l'exercice soit exerçable de bout en bout. En
+production, j'aurai délégué à un fournisseur d'identité managé, avec OIDC.
+
+**L14 — La liste n'a ni filtre, ni tri, ni pagination arrière, ni total.**
+Chaque filtre interagit avec la clé de tri, donc avec le curseur, et un prédicat
+sélectif comme `status` voudrait son propre index. C'est la pression qui plaide
+pour F2 ([liste-documents.md §7](liste-documents.md)).
+
+**L15 — Les documents uploadés ne sont pas téléchargeables.** `ObjectStore.get`
+existe et est testé ; aucune route ne l'expose.
+
+**L16 — Les tests d'intégration sont ignorés sans `TEST_POSTGRES_DSN`.** Un
+`pytest` par défaut est vert alors que les preuves RLS — les tests qui comptent
+le plus — n'ont jamais tourné.
+
+**L17 — L'observabilité s'arrête aux logs.** Le JSON structuré avec corrélation
+requête / tenant / document est en place ([observabilite.md](observabilite.md))
+et répond à « qu'est-il arrivé à cet upload ». Ce qui manque est tout
+l'agrégat : pas d'endpoint de métriques, pas de traces, pas de dashboards, pas
+d'alerting. Chaque déclencheur de ce document — la bande passante d'upload de L1,
+le p95 du pipeline contre 120s, le taux d'abandon de 1,6 %, la profondeur réelle
+de pagination — est énoncé comme un seuil mesurable, et aucun n'est mesurable
+aujourd'hui dans un système en fonctionnement. D'où F3.
+
+## 5. La suite, dans l'ordre
+
+**F1 — Passer l'object store sur S3 (ou tout vrai stockage objet).** Le prochain
+mouvement, et le moins cher. Le stockage objet est la réponse production pour des
+fichiers dans un système distribué : il est fait pour exactement ce profil
+d'opérations — beaucoup d'écrivains indépendants, durabilité et réplication comme
+propriétés du service, règles de cycle de vie et de rétention, chiffrement côté
+serveur, policy par préfixe — dont rien n'est fourni par un répertoire sur le
+disque d'un nœud (L2).
+
+Et c'est peu cher parce que rien ne bouge hors de l'adaptateur. `ObjectStore` est
+déjà taillé sur ce que S3 garantit réellement : `put` possède
+write-commit-abort, ce qui correspond à `UploadPart` /
+`CompleteMultipartUpload` / `AbortMultipartUpload`, et « complet ou absent » est
+exactement ce que cette API fournit. `storage_key` vaut déjà
+`{org_id}/{document_id}`, donc le préfixe tenant dont ont besoin les règles de
+cycle de vie et une clé par tenant est déjà là. Un fichier de plus dans
+`app/infrastructure/storage/`, une ligne dans la racine de composition. Pas de
+changement de modèle de données, pas de changement d'appelant, pas de changement
+d'API.
+
+**F2 — GraphQL pour la liste de documents.** C'est là que REST commence à coûter
+plus qu'il ne rapporte, et la raison est la sélection de champs. Le découpage en
+deux formes sur une même table — `DocumentSummary` ici, le détail par step
+derrière `GET /documents/{id}` — a été subi, pas choisi : l'alternative était
+quatre lignes de step par document listé, à chaque affichage de liste. Le seul
+levier de REST quand les jeux de champs divergent, c'est un endpoint de plus,
+chacun avec sa requête, son schéma et ses tests écrits à la main. La jointure
+uploader montre la même couture un cran plus bas : elle est inconditionnelle,
+donc un client qui ne veut que des noms de fichiers la paie quand même.
+
+En GraphQL, le client nomme les champs dont il a besoin : la réponse s'étend ou
+se réduit par consommateur, et la jointure ne tourne tout simplement pas pour
+l'appelant qui n'a pas demandé `uploadedBy { fullName }`. La pagination arrive
+avec une réponse spécifiée (la Relay connection spec) au lieu d'un codec de
+curseur qu'on réécrirait à l'identique pour chaque future liste, et les filtres
+typés (L14) deviennent un champ à ajouter plutôt qu'une branche dans un
+constructeur de requêtes qui grossit.
+
+La migration est peu chère, et c'est ça l'argument : `DocumentSummary` et
+`DocumentPage` sont des types domaine sans framework dedans, et
+`list_page(limit, after)` est déjà une requête de connexion à la Relay — `after`
+*est* le `after` de Relay. Ce qui serait jeté, c'est le routeur et ses schémas de
+réponse, une soixantaine de lignes. Ce qu'il faut construire à côté est ce que
+REST donne gratuitement : autorisation par champ, limites de profondeur et de
+coût de requête, et une stratégie de persisted queries — l'autorisation par champ
+ratée dans un système multi-tenant est une fuite de données, pas une page lente.
+*Déclencheur :* le deuxième consommateur avec un jeu de champs différent, ou la
+première combinaison de filtres qui fait pousser un constructeur de requêtes
+conditionnel ([liste-documents.md §6](liste-documents.md)).
+
+**F3 — Métriques et traces : OpenTelemetry pour l'instrumentation, un APM
+derrière** (L17). Les logs sont faits ; c'est la moitié manquante, et c'est
+l'élément qui rend le reste de cette liste décidable, puisque chaque point y est
+écrit comme un seuil et qu'aucun ne peut se déclencher aujourd'hui.
+
+- **SDK OpenTelemetry, neutre vis-à-vis du fournisseur par construction.**
+  Instrumenter une fois avec l'API OTel et exporter via le collector ; Prometheus,
+  Datadog, Grafana Cloud ou un backend OTLP natif devient alors une configuration
+  de collector plutôt qu'un changement de code. Engager *l'application* dans un
+  SDK propriétaire est l'erreur à éviter — le même raisonnement qui met `argon2`
+  et `PyJWT` derrière des ports ici.
+- **Traces (Jaeger, ou tout backend OTLP).** Le span qui compte n'est pas la
+  requête HTTP, c'est le document. Une trace enracinée sur l'upload, avec un span
+  fils par step portant numéro de tentative et issue, et le webhook partenaire
+  raccroché par `job_id`, répond à « où est le document X et pourquoi est-il
+  lent » d'une seule vue. Aujourd'hui cette question demande de corréler des logs
+  à la main — et c'est exactement la question qu'on pose à un pipeline en forme de
+  document. Propager `traceparent` sur l'appel sortant l'étend au partemiddleware dans `create_app` : les threads du pipeline et le traitement des
+requêtes se disputent un seul processus et ne se dimensionnent pas séparément.
+`PIPELINE_QUEUE_POLLING_INTERVAL_SECONDS` (défaut 1,0s) coûte par ailleurs deux
+fois par document, soit ~2s des ~63s de marge.naire.
+- **Métriques, prêtes pour Prometheus** (`/metrics`, ou push OTLP) : p95 et p99
+  du pipeline contre le budget de 120s ; durée, nombre de tentatives et taux
+  d'échec par step ; taux d'abandon comme compteur de premier ordre (L8) ;
+  profondeur de file et temps d'attente avant claim, là où passent réellement les
+  ~63s de marge ; débit d'upload et distribution de `size_bytes`, soit exactement
+  le déclencheur de L1/F4 ; latence et taux d'erreur par route ; saturation du
+  pool de connexions.
+- **Le travail sur les logs a déjà posé la couture.** La propagation de
+  `request_id`, l'assainissement du `X-Request-Id` entrant et les clés
+  `document_id` / `workflow_id` qui survivent au passage vers les workers
+  détachés sont exactement ce qu'un contexte de trace remplace et prolonge :
+  `trace_id` rejoint les champs existants plutôt qu'il ne les remplace.
+- **Les points d'instrumentation sont déjà isolés**, et c'est ce qui rend
+  l'ajout peu cher : FastAPI et SQLAlchemy ont de l'auto-instrumentation OTel, et
+  les wrappers de step dans `app/pipeline/` sont le point de passage unique de
+  toute transition — le même endroit où la projection est écrite et où les
+  événements de log sont émis.
+- **La cardinalité est la seule chose à ne pas rater.** `document_id` va sur un
+  attribut de span, jamais sur un label de métrique. Les labels restent bornés :
+  nom de step, issue, et — seulement si le nombre de tenants reste de l'ordre de
+  la centaine — `org_id`.
+
+**F4 — Uploads presigned et chunked** (L1, L3). Les octets vont client →
+stockage et l'API ne fait plus que signer. Conditionné à F1, puisque présigner un
+répertoire POSIX n'a pas de sens. Deux conséquences à nommer plutôt qu'à
+découvrir : ça supprime la propriété « refuser avant d'écrire quoi que ce soit »,
+puisque le contrôle des octets de tête PDF tourne aujourd'hui sur les 4 premiers
+Ko *dans l'API* — ce contrôle se déplace vers une validation post-complétion ou
+dans l'OCR, et la limite de taille devient une condition `content-length-range`
+de policy. Et ça promeut les uploads abandonnés au rang de problème de premier
+ordre — une URL émise jamais utilisée, un multipart démarré jamais terminé — ce
+qui rend F5 obligatoire plutôt qu'optionnel.
+
+**F5 — Jobs de réconciliation.** Un job, trois requêtes, toutes détectant des
+états incapables de progresser seuls : un document `awaiting_partner` dont le
+step `external_call` s'est terminé il y a plus de N minutes (L6, L7) ; des blobs
+sans ligne (L5) ; et, une fois le presigned en place, les multipart incomplets —
+que S3 expire d'ailleurs seul avec une règle de cycle de vie
+`AbortIncompleteMultipartUpload`.
+
+**F6 — Pousser le texte OCR dans l'object store.** Le step doit renvoyer une clé
+de stockage, pas des mégaoctets de texte. Ça retire de la projection *et* du
+checkpoint le seul payload qui croît avec la taille du document, et c'est du
+câblage plutôt que de l'infrastructure nouvelle.
+
+**F7 — Table de dead-letter et endpoint de rejeu** (L8).
+
+**F8 — `Idempotency-Key` à l'upload** (L4) : un en-tête et une contrainte
+d'unicité, pas une déduplication côté client.
+
+**F9 — Un endpoint de téléchargement** (L15). `ObjectStore.get` est déjà testé :
+il reste une route et une réponse streamée.
+
+**F10 — Déléguer l'authentification à un fournisseur d'identité managé** (L13),
+et un ticket de flux à courte durée de vie pour que l'`EventSource` du navigateur
+s'authentifie sans token en query string (L12). C'est la même décision — arrêter
+de fabriquer des credentials à la main — et les deux attendent un vrai client.
+
+**F11 — Séparer les workers du processus d'API** (L10), pour que les deux se
+dimensionnent indépendamment et qu'une rafale de threads pipeline ne dégrade pas
+la latence des requêtes.
+
+**F12 — Un hook pre-commit lançant `ruff`, `mypy` et les tests**, et une
+exécution d'intégration qui échoue au lieu d'être ignorée quand la base est
+absente (L16). La CI elle-même est hors périmètre de l'exercice.
+
+**F13 — Un test de charge qui produit le p95 au lieu de le simuler.**

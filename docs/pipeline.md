@@ -1,267 +1,251 @@
-# The document processing pipeline
+# Le pipeline de traitement des documents
 
-How the pipeline is built and why. The choice of orchestrator is argued
-separately in [architecture.md](architecture.md); this is about the code that
-is here.
+Comment le pipeline est construit et pourquoi. Le choix de l'orchestrateur est
+argumenté dans [orchestration.md](orchestration.md) ; ici, il s'agit du code.
 
 ```
-upload committed ──► ocr ──► metadata ──┐
-                        └──► chunking ──┴──► external_call ──► awaiting_partner
-                                                                      │
-                                              POST /webhooks/partner ─┘──► ready
+upload commité ──► ocr ──► metadata ──┐
+                      └──► chunking ──┴──► external_call ──► awaiting_partner
+                                                                    │
+                                            POST /webhooks/partner ─┘──► ready
 ```
 
-## What triggers it
+## Ce qui le déclenche
 
-The pipeline is triggered as the upload finishes — specifically, when the
-transaction holding the document row and its four step rows **commits**. Only
-then is the job enqueued.
+Le pipeline démarre quand la transaction portant la ligne document et ses quatre
+lignes de step **commite** — et seulement alors le job est enfilé. Enfiler dans
+la transaction est une course que le worker gagne généralement, puisqu'il
+n'attend pas un client HTTP : il prendrait un job et ne trouverait rien à mettre
+à jour.
 
-That order is the whole point. Enqueueing inside the transaction is a race the
-worker usually wins, because it is not waiting on an HTTP client: it would pick
-up a job and find nothing to update.
+C'est `upload_document` qui en est responsable. Il possédait déjà « ce qui rend
+un upload acceptable » ; il possède désormais aussi « l'upload est terminé », qui
+est le même fait. Il commite, démarre le pipeline, enregistre l'id de workflow,
+et commite à nouveau. Cela demande une session que le handler commite lui-même,
+donc l'endpoint d'upload tourne sur `Database.tenant_session_manual` plutôt que
+sur `tenant_session`, qui ne commite qu'après la réponse. Commiter efface
+`app.current_org_id` — `set_config` demande une valeur locale à la transaction
+pour qu'elle ne fuie pas vers le prochain emprunt d'une connexion poolée — et
+`TenantUnitOfWork` la ré-épingle après chaque commit, ce qui préserve la
+propriété.
 
-`upload_document` in `app/application/upload_document.py` owns this. It already
-owned "what makes an upload acceptable"; it now also owns "the upload is
-finished", which is the same fact. It commits, starts the pipeline, records the
-workflow id, and commits again.
+`tests/unit/test_upload_document.py` asserte qu'un commit avait bien eu lieu au
+moment de l'appel au runner, et qu'un upload échoué ne démarre jamais de
+pipeline.
 
-That requires a session the handler commits itself, so the upload endpoint runs
-on `Database.tenant_session_manual` rather than the request-scoped
-`tenant_session`, which only commits when its block ends — after the response.
-Committing clears `app.current_org_id`, since `set_config` asks for a
-transaction-local value so it cannot leak to the next checkout of a pooled
-connection; `TenantUnitOfWork` re-pins it after each commit, keeping that
-property intact.
+## À quoi sert `external_call`
 
-`tests/unit/test_upload_document.py` asserts a commit had already happened when
-the runner was called, and that a failed upload never starts a pipeline.
+Le partenaire est un **service d'archivage réglementé** : il indexe les chunks
+dans un coffre de conformité, valide les métadonnées extraites contre des règles
+de rétention, et publie le document dans le système d'enregistrement du client.
+Ce travail prend des minutes à des heures de leur côté, donc l'appel ne renvoie
+qu'un `job_id` opaque et le résultat arrive plus tard par webhook.
 
-## What `external_call` is for
+## La jonction du webhook
 
-The partner is a **regulated-archive service**: it indexes the chunks into a
-compliance vault, validates the extracted metadata against retention rules, and
-publishes the document to the client's records system. The work takes minutes
-to hours on their side, so the call returns only an opaque `job_id` and the
-outcome arrives later by webhook.
+Le workflow **se termine** à `awaiting_partner` plutôt que de parker sur
+`DBOS.recv()`. Parker fonctionne, mais garder un état de workflow ouvert pendant
+des heures face à un tiers n'apporte rien qu'une colonne de statut et une clé de
+corrélation n'apportent, et couper à cet endroit garde le webhook entrant
+testable indépendamment.
 
-## The webhook seam
+Le contrat sur lequel s'appuie `DbPartnerJobSink` :
 
-The workflow **ends** at `awaiting_partner`. It does not park on `DBOS.recv()`.
-Parking works, but holding workflow state open for hours against a third party
-buys nothing a status column and a correlation key do not, and splitting at
-that seam keeps the inbound webhook independently testable.
+- Un document n'est **jamais** en `awaiting_partner` sans un `partner_job_id`
+  visible. Les deux sont écrits dans la transaction qui marque `external_call`
+  réussi, parce que le partenaire peut rappeler à l'instant même où il rend la
+  main.
+- `partner_job_id` est unique, donc une notification ne peut jamais résoudre vers
+  deux documents.
+- La résolution passe par la **session système** (`BYPASSRLS`). Le partenaire ne
+  nomme aucun tenant — il n'a que le `job_id` — donc il n'y a rien pour scoper la
+  recherche tant que la ligne n'est pas trouvée, et l'organisation en est ensuite
+  *dérivée*. Même raisonnement que « trouver un utilisateur par email » au login.
+- La livraison est idempotente. Les partenaires rejouent, et un document sorti de
+  `awaiting_partner` est décidé ; ré-appliquer pourrait faire basculer un
+  document `ready` en `failed` sur une reprise obsolète.
 
-The contract, which `DbPartnerJobSink` relies on:
+`ready` n'est atteignable que par ce chemin. Signature, fraîcheur et codes de
+statut sont dans [webhook-entrant.md](webhook-entrant.md).
 
-- A document is **never** in `awaiting_partner` without a visible
-  `partner_job_id`. Both are written in the transaction that marks
-  `external_call` succeeded, because the partner may call back the instant it
-  returns.
-- `partner_job_id` is unique, so a notification can never resolve to two
-  documents.
-- Resolution runs on the **system session** (`BYPASSRLS`). The partner names no
-  tenant — `job_id` is all it has — so there is nothing to scope the lookup to
-  until the row is found. The organization is then *derived* from that row.
-  This is the same reasoning that already puts "find a user by email" on the
-  system session during login.
-- Delivery is idempotent. Partners retry, and a document that has left
-  `awaiting_partner` is decided; re-applying could flip a `ready` document to
-  `failed` on a stale retry.
+## Suivre la progression
 
-`ready` is reachable only through this path.
+`GET /documents/{id}/events` streame du `text/event-stream`. Mesuré contre la
+stack en fonctionnement, un changement de statut atteint un client connecté en
+**~80 ms** ; la cible était « de l'ordre de la seconde ».
 
-## Following progress
-
-`GET /documents/{id}/events` streams `text/event-stream`. Measured against the
-running stack, a status change reaches a connected client in **~80ms** — the
-target was "of the order of a second".
-
-The mechanism is one hop, because the event source already exists: every status
-change is a write to `document_steps`, and migration `0004` turns every such
-write into a `NOTIFY`. Postgres is already the broker, so nothing was added.
+Le mécanisme tient en un saut, parce que la source d'événements existe déjà :
+chaque changement de statut est une écriture dans `document_steps`, et la
+migration `0005` transforme chacune en `NOTIFY`. Postgres est déjà le broker,
+donc rien n'a été ajouté à `compose.yaml`.
 
 ```
 worker / webhook ──commit──► trigger ──pg_notify('document_progress', <doc_id>)
                                                     │
-                                     one LISTEN connection per API process
+                                 une connexion LISTEN par processus d'API
                                                     │
-                                          in-memory fan-out
+                                          fan-out en mémoire
                                                     │
-                                  SSE task re-reads projection → yields
+                            la tâche SSE relit la projection → yield
 ```
 
-**Why a trigger rather than application code.** `NOTIFY` is transactional: it
-is delivered on commit and never for a write that rolls back, so a listener is
-never told about a row it could not read. And it covers every write path by
-construction — including the partner webhook, which sets `ready` through a
-different repository on the *system* session, and which is exactly the sort of
-path application-level notification forgets.
-`tests/integration/test_progress_notify.py` pins all three properties.
+**Pourquoi un trigger plutôt que du code applicatif.** `NOTIFY` est
+transactionnel : il est délivré au commit et jamais pour une écriture annulée,
+donc un listener n'est jamais informé d'une ligne qu'il ne pourrait pas lire. Et
+il couvre tous les chemins d'écriture par construction — y compris le webhook
+partenaire, qui pose `ready` via un autre repository sur la session *système*, et
+qui est exactement le genre de chemin qu'une notification applicative oublie.
+`tests/integration/test_progress_notify.py` épingle les deux.
 
-**Why the payload is only an id.** Subscribers re-read the projection, so a
-duplicated, coalesced or out-of-order notification is harmless, there is no
-8000-byte payload cap to design around, and no tenant data crosses a channel
-every process listens to. The event body is the same
-`DocumentDetailResponse` the polling endpoint returns, so the two cannot drift.
+**Pourquoi le payload n'est qu'un id.** Les abonnés relisent la projection, donc
+une notification dupliquée, coalescée ou désordonnée est sans conséquence, il n'y
+a pas de plafond de 8000 octets à contourner, et aucune donnée tenant ne traverse
+un canal que tous les processus écoutent. Le corps de l'événement est le même
+`DocumentDetailResponse` que renvoie l'endpoint de polling : les deux ne peuvent
+pas diverger.
 
-**Why it costs so little.** One `LISTEN` connection *per process*, not per
-subscriber: 5,000 watchers cost 5,000 sockets and one database connection.
-Reads scale with events, not with watchers × seconds — 37–112× less work than
-1s polling at the 12-month target:
+**Pourquoi ça coûte si peu.** Une connexion `LISTEN` *par processus*, pas par
+abonné : 5 000 watchers coûtent 5 000 sockets et une connexion base. Les lectures
+suivent les événements, pas watchers × secondes — 37 à 112× moins de travail
+qu'un polling à 1s à la cible 12 mois :
 
-| | watchers | push | poll @1s |
+| | watchers | push | polling @1s |
 |---|---|---|---|
-| today | 50 | 0.4 events/s | 50 req/s |
-| 12-month peak | 5,000 | 134 events/s | 5,000 req/s |
+| aujourd'hui | 50 | 0,4 évén./s | 50 req/s |
+| pic à 12 mois | 5 000 | 134 évén./s | 5 000 req/s |
 
-Three details that keep it honest:
+Trois détails qui tiennent l'ensemble :
 
-- **Coalescing is free.** Each subscriber's queue is `maxsize=1` and drops when
-  full — a pending wake already means "re-read", so a second is redundant. The
-  debouncer is the queue, with no timer.
-- **Every connection opens with a snapshot**, which is what makes reconnection
-  need no replay, and what makes the 5-minute connection cap safe rather than
-  lossy. A document parked in `awaiting_partner` overnight does not hold a
-  socket overnight.
-- **A listener reconnect wakes every subscriber**, because notifications that
-  arrived while the connection was down are gone.
+- **La coalescence est gratuite.** La queue de chaque abonné est en `maxsize=1`
+  et jette quand elle est pleine — un réveil déjà en attente signifie « relis »,
+  un second dirait exactement la même chose. Le debouncer est la queue, sans
+  timer.
+- **Chaque connexion s'ouvre sur un snapshot**, ce qui rend la reconnexion sans
+  rejeu et rend le plafond de 5 minutes par connexion sûr plutôt que lossy. Un
+  document parké en `awaiting_partner` toute la nuit ne tient pas une socket
+  toute la nuit.
+- **Une reconnexion du listener réveille tous les abonnés**, parce que les
+  notifications émises pendant la coupure sont perdues.
 
-**Swagger cannot render a stream** — it will appear to hang. Use `curl -N`, or
-poll `GET /documents/{id}`, which returns the identical body.
+**Swagger ne sait pas afficher un flux** — il semblera figé. Utilisez `curl -N`,
+ou faites du polling sur `GET /documents/{id}`, qui renvoie le corps identique.
 
 ```bash
 curl -N -H "Authorization: Bearer $TOKEN" \
   http://localhost:8000/documents/$DOC/events
 ```
 
-Browser `EventSource` cannot send an `Authorization` header, so a real UI would
-need a short-lived stream ticket. Not built: there is no UI, and inventing the
-ticket endpoint now would be speculative.
+L'`EventSource` du navigateur ne peut pas envoyer d'en-tête `Authorization` : une
+vraie UI demanderait un ticket de flux à courte durée de vie. Non construit — il
+n'y a pas d'UI, et inventer cet endpoint maintenant serait spéculatif.
 
-## Retry policy: measured, not chosen
+## Politique de retry : mesurée, pas choisie
 
-The provider mocks sleep *before* the failure check, so a failed attempt costs
-the same wall-clock as a successful one. Retrying is expensive here, which is
-why the policy is measured. `scripts/simulate_pipeline.py`, 200,000 simulated
-pipelines:
+Les mocks fournisseurs dorment *avant* le tirage d'échec, donc une tentative
+ratée coûte le même temps qu'une réussie : réessayer coûte cher ici, d'où une
+politique mesurée. `scripts/simulate_pipeline.py`, 200 000 pipelines simulés :
 
-| policy | p50 | p95 | p99 | documents given up |
+| politique | p50 | p95 | p99 | documents abandonnés |
 |---|---|---|---|---|
-| 1 attempt (no retry) | 18.7s | 26.6s | 28.7s | **80.2%** |
-| 3 attempts, no backoff | 25.3s | 42.6s | 51.1s | 14.1% |
-| 5 attempts, no backoff | 26.6s | 48.5s | 60.4s | 1.6% |
-| **5 attempts, expo 1/2/4/8s** | **28.5s** | **56.9s** | **73.7s** | **1.6%** |
-| 5 attempts, expo 5/10/20/40s | 35.3s | 95.1s | 137.3s | 1.7% |
+| 1 tentative (sans retry) | 18,7s | 26,6s | 28,7s | **80,2 %** |
+| 3 tentatives, sans backoff | 25,3s | 42,6s | 51,1s | 14,1 % |
+| 5 tentatives, sans backoff | 26,6s | 48,5s | 60,4s | 1,6 % |
+| **5 tentatives, expo 1/2/4/8s** | **28,5s** | **56,9s** | **73,7s** | **1,6 %** |
+| 5 tentatives, expo 5/10/20/40s | 35,3s | 95,1s | 137,3s | 1,7 % |
 
-- **Retries are load-bearing.** Without them 80% of documents never reach the
-  partner. DBOS ships `retries_allowed=False, max_attempts=3`; taking that
-  default would mean a 14% give-up rate.
-- **Backoff must stay small.** Exponential-with-5s-base puts p99 past the 120s
-  target on its own. These failures are simulated coin flips, not a struggling
-  downstream, so patience buys nothing.
-- **The headroom is for queueing.** p95 of 56.9s against 120s leaves ~63s,
-  which is the budget for waiting for a worker — the real scaling constraint.
-- **The fan-out earns ~9s at p95** (56.9s parallel against 65.5s serial).
+- **Les retries sont structurants.** Sans eux, 80 % des documents n'atteignent
+  jamais le partenaire. DBOS livre `retries_allowed=False, max_attempts=3` ; ce
+  défaut donnerait 14 % d'abandon.
+- **Le backoff doit rester petit.** Une base de 5s pousse à elle seule le p99
+  au-delà des 120s. Ces échecs sont des tirages à pile ou face simulés, pas un
+  aval en souffrance : la patience n'achète rien.
+- **La marge est là pour la mise en file.** Un p95 de 56,9s contre 120s laisse
+  ~63s, qui sont le budget d'attente d'un worker — la vraie contrainte de scale.
+- **Le fan-out gagne ~9s au p95** (56,9s en parallèle contre 65,5s en série).
 
-`tests/unit/test_retry_policy.py` pins these numbers, so lowering them fails the
-build rather than silently tripling the give-up rate.
+`tests/unit/test_retry_policy.py` épingle ces nombres : les baisser fait échouer
+le build au lieu de tripler silencieusement le taux d'abandon.
 
-## Data model: two owners, one direction
+## Modèle de données : deux propriétaires, un sens
 
-DBOS checkpoints every step to its own tables in the `dbos` schema. `documents`
-and `document_steps` are a **tenant-facing read model** — written by the step
-wrappers, read by the API, never orchestrated off. We do not read DBOS's schema;
-that is its internal contract, not ours.
+DBOS checkpointe chaque step dans ses propres tables du schéma `dbos`.
+`documents` et `document_steps` sont un **modèle de lecture exposé au tenant** —
+écrit par les wrappers de step, lu par l'API, jamais orchestré dessus. Nous ne
+lisons pas le schéma de DBOS : c'est son contrat interne, pas le nôtre. La
+duplication est délibérée et à sens unique, ce qui la distingue du problème des
+deux sources de vérité que crée un broker.
 
-The duplication is deliberate and one-way. It is not the two-sources-of-truth
-problem a broker creates, where both stores are load-bearing.
+- **`org_id` est en tête d'index**, donc la liste d'un tenant est un parcours
+  d'intervalle d'index plutôt qu'un scan-puis-filtre.
+- **Les quatre lignes de step existent dès la création**, écrites dans la même
+  transaction que le document. « Pas démarré » est une ligne à `status=pending`,
+  jamais une ligne absente : rien en aval n'a de cas particulier pour la
+  progression partielle, et tout écrivain ultérieur peut supposer que sa ligne
+  existe.
+- **`output` est toujours du `jsonb`.** Un vrai texte OCR pèse des mégaoctets ;
+  seul un aperçu est projeté (`{"chars": n, "preview": "..."}`) et le texte
+  complet reste dans le checkpoint. L'inliner coûterait ~10 Go/jour
+  d'amplification d'écriture à la cible.
+- **`document_steps` porte un `org_id` dénormalisé.** Toute autre table tenant
+  fonde sa politique RLS sur une colonne qu'elle possède, et une politique qui
+  devrait rejoindre `documents` serait à la fois plus lente et un cas particulier
+  dans la migration.
 
-Three choices worth naming:
-
-- **`org_id` leads the index** (`ix_documents_org_id_created_at`, from the
-  upload work), so a tenant's document list is an index range scan rather than
-  a scan-then-filter.
-- **All four step rows exist from creation**, written in the same transaction
-  as the document. "Not started" is a row with `status=pending`, never a
-  missing row, so nothing downstream needs a special case for partial
-  progress — and every later writer may assume its row exists.
-- **`output` is always `jsonb`.** Real OCR text is megabytes; only a preview is
-  projected (`{"chars": n, "preview": "..."}`) and the full text stays in the
-  DBOS checkpoint. Inlining it would be ~10GB/day of write amplification at the
-  12-month target.
-
-`document_steps` carries a denormalized `org_id`. Every other tenant table keys
-its RLS policy on a column it owns, and a policy that had to join back to
-`documents` would be both slower and a special case in the migration.
-
-Migration `0003_pipeline` adds `workflow_id`, `partner_job_id` and
-`failed_step` to the `documents` table that `0002_documents` created for the
-upload path, plus `document_steps` and its policy. `DocumentStatus` grew from
-one value to five; it was already a string column rather than a native enum
-precisely so that adding values would not need a lock.
+La migration `0003` ajoute `workflow_id`, `partner_job_id` et `failed_step` à
+`documents`, plus `document_steps` et sa politique. `DocumentStatus` est passé
+d'une à cinq valeurs ; c'était déjà une colonne texte plutôt qu'un enum natif,
+précisément pour qu'ajouter des valeurs ne demande pas de verrou.
 
 ## Tenancy
 
-Pipeline workers write these rows with **no user present**, which is the
-interesting case. Their organization comes from the workflow's own argument,
-which is also what pins `app.current_org_id` on their session — so worker writes
-are covered by row-level security exactly like request writes, and a worker
-cannot write outside the tenant it was started for.
+Les workers du pipeline écrivent **sans utilisateur présent**, et c'est le cas
+intéressant. Leur organisation vient de l'argument du workflow lui-même, qui est
+aussi ce qui épingle `app.current_org_id` sur leur session : les écritures worker
+sont couvertes par RLS exactement comme les écritures de requête, et un worker ne
+peut pas écrire hors du tenant pour lequel il a été démarré.
 
-The work queue is **partitioned by `org_id`**, so one organization uploading
-10,000 documents cannot starve another organization's single upload. Without
-that, tenant fairness is a queue-ordering accident.
+La file de travail est **partitionnée par `org_id`**, donc une organisation
+uploadant 10 000 documents ne peut pas affamer l'upload unique d'une autre. Sans
+ça, l'équité entre tenants est un accident d'ordonnancement.
 
-`tests/integration/test_document_tenancy.py` asserts isolation twice: once
-through the repository, which filters explicitly, and once through deliberately
-unfiltered SQL, which only the database can stop.
+`tests/integration/test_document_tenancy.py` asserte l'isolation deux fois : via
+le repository, qui filtre explicitement, et via du SQL volontairement non filtré,
+que seule la base peut arrêter.
 
-## The blocking sleep problem
+## Le problème du sleep bloquant
 
-The provider mocks call a blocking `time.sleep()`, so every in-flight step
-holds a thread. The steps are `async` and push the mocks to `asyncio.to_thread`,
-which keeps the event loop free but does not remove the thread.
+Les mocks fournisseurs appellent un `time.sleep()` bloquant, donc chaque step en
+vol tient un thread. Les steps sont `async` et poussent les mocks dans
+`asyncio.to_thread`, ce qui garde la boucle d'événements libre mais ne supprime
+pas le thread. À la charge d'aujourd'hui c'est ~0,4 step concurrent ; à la cible
+12 mois c'est ~390, ce qui fait trop de threads OS pour être confortable. Le
+sleep du mock tient lieu d'E/S réseau, donc la correction est d'`await` de vrais
+appels HTTP quand les fournisseurs seront réels — et alors 390 coroutines ne sont
+rien. Signalé plutôt que résolu : le construire maintenant, ce serait construire
+pour une charge qui n'existe pas.
 
-At today's load that is ~0.4 concurrent steps and irrelevant. At the 12-month
-target it is ~390, which is too many OS threads to be comfortable. The mock's
-sleep stands in for network I/O, so the fix is not more threads — it is that
-these become `await`ed HTTP calls once the providers are real, at which point
-390 concurrent coroutines is nothing. Flagged rather than solved: building for
-it now would be building for a load that does not exist.
+`PIPELINE_QUEUE_POLLING_INTERVAL_SECONDS` (défaut 1,0s) est de la latence pure,
+et tombe deux fois par document : ~2s des ~63s de marge.
 
-`PIPELINE_QUEUE_POLLING_INTERVAL_SECONDS` (default 1.0s) is pure added latency
-and lands twice per document, spending ~2s of the ~63s headroom.
+## Tests
 
-## Testing
+Le code fournisseur n'est jamais modifié, y compris par les tests. `steps.py`
+résout `random` depuis ses propres globales de module, donc un test peut
+remplacer **ce seul nom** ; le vrai module `random`, et tout ce qui l'utilise
+ailleurs, reste intact.
 
-The provider code is never modified, including by tests. `steps.py` resolves
-`random` from its own module globals, so a test can replace **that one name**;
-the real `random` module, and everything else using it, is untouched.
-
-- `tests/unit/test_steps_contract.py` diffs the shipped module against the code
-  block in `README.md` — the statement itself. Every latency number above
-  derives from those mocks, so a well-meaning cleanup fails loudly instead of
-  silently invalidating them. Both `ruff format` and its import sorting would
-  break the match, which is why the file is excluded from each in
+- `tests/unit/test_steps_contract.py` diffe le module livré contre le bloc de
+  code de `README.md` — l'énoncé lui-même. Tous les nombres de latence ci-dessus
+  dérivent de ces mocks, donc un nettoyage bien intentionné échoue bruyamment au
+  lieu de les invalider silencieusement. `ruff format` comme son tri d'imports
+  casseraient la correspondance, d'où l'exclusion du fichier dans
   `pyproject.toml`.
-- `tests/unit/` covers the use cases and the projection against fakes; no
-  database, no orchestrator.
-- `tests/integration/` covers RLS for `documents` and `document_steps`, and the
-  real partner sink, against Postgres running the actual migrations.
-- The pipeline running end to end is exercised through `docker compose`.
+- `tests/unit/` couvre les cas d'usage et la projection contre des fakes : pas de
+  base, pas d'orchestrateur.
+- `tests/integration/` couvre RLS sur `documents` et `document_steps`, le trigger
+  `NOTIFY` et le vrai sink partenaire, contre un Postgres exécutant les vraies
+  migrations.
+- Le pipeline de bout en bout est exercé via `docker compose`.
 
-## What I would do with more time
-
-- **Push OCR text into object storage.** The step should return a storage key,
-  not megabytes of text. `ObjectStore` already exists for uploaded documents,
-  so this is wiring rather than new infrastructure — but it is not wired.
-- **A sweep for ghosted partners.** `status = 'awaiting_partner' AND updated_at
-  < now() - interval '24h'` has no home yet; today such a document waits
-  forever.
-- **A stream ticket for browsers**, so `EventSource` can authenticate without
-  putting a token in the query string.
-- **Dead-letter handling and a replay endpoint.** 1.6% give-up is ~1,600
-  documents/day at target. Checkpointing means replay resumes rather than
-  restarts; nothing exposes that yet.
-- **A load test** that produces the p95 rather than simulating it.
+Les limites connues et la suite sont rassemblées dans
+[decisions-et-limites.md](decisions-et-limites.md).

@@ -1,72 +1,76 @@
-# Contributing
+# Contribuer
 
-## Prerequisites
+Comment lancer, tester et naviguer dans le projet. *Pourquoi* il est construit
+ainsi est dans [README_TAKE_HOME.md](README_TAKE_HOME.md) et les documents qu'il
+indexe.
+
+## Prérequis
 
 - [uv](https://docs.astral.sh/uv/) (`curl -LsSf https://astral.sh/uv/install.sh | sh`)
-- Docker with Compose v2, for the container workflow
+- Docker avec Compose v2, pour le parcours conteneurisé
 
-You do **not** need a system Python. The project targets **Python 3.14 as the
-minimum** (`requires-python = ">=3.14"`) and pins 3.14 in `.python-version`; uv
-downloads that interpreter on first use.
+Vous n'avez **pas** besoin d'un Python système. Le projet vise **Python 3.14 au
+minimum** (`requires-python = ">=3.14"`) et l'épingle dans `.python-version` ; uv
+télécharge cet interpréteur au premier usage.
 
-## Run it
+## Le lancer
 
-### With Docker (closest to production)
+### Avec Docker (au plus près de la production)
 
 ```bash
 docker compose up --build
 ```
 
-- API: http://localhost:8000
-- Swagger UI: http://localhost:8000/docs
-- Health: http://localhost:8000/health
+- API : http://localhost:8000 · Swagger : http://localhost:8000/docs · Santé :
+  http://localhost:8000/health
 
-Compose declares a healthcheck, so `docker compose ps` reports `healthy` once
-the app answers. Stop with `docker compose down` (add `-v` to drop the database
-volume too).
+L'ordre de démarrage est `db` → `migrate` → `seed` → `api`, chacun conditionné à
+la fin du précédent, donc l'API ne démarre jamais contre une base non migrée.
+Compose déclare un healthcheck : `docker compose ps` affiche `healthy` dès que
+l'application répond. Arrêt avec `docker compose down` (ajouter `-v` pour
+supprimer aussi le volume).
 
-Boot order is `db` → `migrate` → `seed` → `api`, each gated on the previous one
-finishing, so the API never starts against an unmigrated database.
+### Se connecter
 
-### Signing in
+Le seed crée deux organisations avec un utilisateur chacune :
 
-The seed creates two organizations with one user each:
-
-| Organization | Email | Password |
+| Organisation | Email | Mot de passe |
 |---|---|---|
 | Acme Corp | `alice@acme.example.com` | `password123` |
 | Globex | `bob@globex.example.com` | `password123` |
 
-`POST /auth/login` returns an access token; paste it into the **Authorize**
-button in Swagger to exercise the authenticated endpoints.
+`POST /auth/login` renvoie un token d'accès ; collez-le dans le bouton
+**Authorize** de Swagger pour exercer les endpoints authentifiés.
 
-### Locally, with hot reload
+### En local, avec rechargement à chaud
 
 ```bash
-uv sync                                          # create .venv from uv.lock
-docker compose up -d db                          # Postgres on its own
-uv run alembic upgrade head                      # schema, roles, RLS policies
-uv run python -m app.seed                        # two orgs, two users
+uv sync                                          # crée .venv depuis uv.lock
+docker compose up -d db                          # Postgres seul
+uv run alembic upgrade head                      # schéma, rôles, politiques RLS
+uv run python -m app.seed                        # deux orgs, deux utilisateurs
 uv run uvicorn app.main:app --reload             # http://127.0.0.1:8000
 ```
 
-The compose `db` service does not publish a port, so for a host-side run either
-add one or point `DATABASE_URL` / `AUTH_DATABASE_URL` / `MIGRATION_DATABASE_URL`
-at your own Postgres. `uv sync` installs the dev group too. There is no
-`activate` step to remember — `uv run <cmd>` executes inside the project
-environment.
+Le service `db` de compose ne publie pas de port : pour une exécution côté hôte,
+soit vous en ajoutez un, soit vous pointez `DATABASE_URL` / `AUTH_DATABASE_URL` /
+`MIGRATION_DATABASE_URL` vers votre propre Postgres, et `STORAGE_ROOT` vers un
+répertoire accessible en écriture (`STORAGE_ROOT=./var/uploads`). `uv sync`
+installe aussi le groupe dev, et `uv run <cmd>` s'exécute dans l'environnement du
+projet — il n'y a aucun `activate` à retenir.
 
-## Tests and lint
+## Tests et lint
 
 ```bash
-uv run pytest                # unit + API tests, no database needed
+uv run pytest                # tests unitaires + API, aucune base requise
 uv run ruff check .          # lint
-uv run ruff format .         # format
+uv run ruff format .         # formatage
 ```
 
-Unit and API tests use in-memory fakes for the repositories, so the default run
-needs no services. The integration tests exercise row-level security against a
-real Postgres and are **skipped** unless you point them at one:
+Les tests unitaires et d'API utilisent des fakes en mémoire : l'exécution par
+défaut ne demande aucun service. Les tests d'intégration exercent la row-level
+security et le trigger `NOTIFY` contre un vrai Postgres et sont **ignorés** tant
+qu'on ne les pointe pas vers un :
 
 ```bash
 docker run --rm -d -p 5433:5432 -e POSTGRES_PASSWORD=postgres \
@@ -74,192 +78,79 @@ docker run --rm -d -p 5433:5432 -e POSTGRES_PASSWORD=postgres \
 TEST_POSTGRES_DSN='postgres:postgres@localhost:5433/appdb' uv run pytest
 ```
 
-The fixture drops and recreates the `public` schema, then runs the real Alembic
-migration — so the policies and roles are under test, not a reimplementation of
-them. Point it only at a throwaway database.
+La fixture supprime et recrée le schéma `public`, puis exécute la vraie migration
+Alembic — ce sont donc les politiques et les rôles qui sont testés, pas une
+réimplémentation. À ne pointer que vers une base jetable.
 
-## The document pipeline
+**`app/pipeline/steps.py` est reproduit à l'octet près depuis `README.md` et ne
+doit pas être modifié** — pas même reformaté. `tests/unit/test_steps_contract.py`
+le diffe contre l'énoncé, et le fichier est exclu de `ruff format` comme de son
+tri d'imports dans `pyproject.toml`.
 
-A completed upload starts a four-step pipeline — OCR, then metadata and
-chunking in parallel, then an outbound call to a partner — orchestrated by
-[DBOS Transact](https://github.com/dbos-inc/dbos-transact-py) as durable,
-checkpointed steps. `POST /documents` returns 201 as soon as the row is
-committed; follow progress with `GET /documents/{id}`.
+## Organisation
 
-The pipeline stops at `awaiting_partner`. Only a verified `POST
-/webhooks/partner` moves a document to `ready`.
+```
+app/domain/          entités, ports (Protocols), erreurs — ni I/O, ni framework
+app/application/     cas d'usage : login, refresh, logout, upload_document
+app/infrastructure/  SQLAlchemy, argon2, PyJWT, object store POSIX, hub LISTEN
+app/api/             routeurs FastAPI, dépendances, mapping d'erreurs, middlewares
+app/pipeline/        steps et workflow DBOS ; steps.py est l'énoncé verbatim
+app/config.py        configuration, entièrement pilotée par l'environnement
+app/observability.py configuration des logs et middleware de contexte de requête
+app/seed.py          seed de développement idempotent
+app/main.py          fabrique d'application et endpoint /health
+scripts/             simulate_pipeline.py — d'où viennent les chiffres de latence
+migrations/          Alembic ; 0001 auth/RLS · 0002 documents · 0003 pipeline ·
+                     0004 index de liste · 0005 NOTIFY de progression
+tests/unit/          cas d'usage contre des fakes en mémoire
+tests/api/           routes avec les adaptateurs surchargés
+tests/integration/   vrai Postgres ; prouve RLS. Ignorés sans TEST_POSTGRES_DSN
+Dockerfile           build multi-stage, runtime distroless
+compose.yaml         db, migrate, seed, api
+```
 
-Progress is pushed, not polled: `GET /documents/{id}/events` streams
-Server-Sent Events, woken by a Postgres `NOTIFY` fired on commit, so a status
-change reaches the client in milliseconds. Swagger cannot render a stream —
-use `curl -N`, or poll `GET /documents/{id}` for the identical body.
+Les dépendances ne pointent que vers l'intérieur : `domain` n'importe que la
+bibliothèque standard, `application` importe `domain`, `infrastructure`
+implémente les ports du domaine, et `api` câble le tout.
+`[tool.uv] package = false` — c'est une application, pas une bibliothèque ;
+`pytest` trouve `app/` via `pythonpath = ["."]`.
 
-DBOS keeps its state in the `dbos` schema of the same database and migrates it
-on launch, so compose gains no service. Worker writes go through the same
-RLS-scoped sessions as request writes; a worker's organization comes from its
-workflow argument.
+## Configuration
 
-**`app/pipeline/steps.py` is reproduced byte-for-byte from `README.md` and must
-not be edited** — not even reformatted. `tests/unit/test_steps_contract.py`
-diffs it against the statement, and the file is excluded from both `ruff format`
-and its import sorting in `pyproject.toml`.
+Tout passe par l'environnement, via `app/config.py`. Les variables les plus
+susceptibles d'être touchées :
 
-- [docs/pipeline.md](docs/pipeline.md) — data model, retry policy, the webhook
-  contract, testing
-- [docs/architecture.md](docs/architecture.md) — why DBOS, and what would
-  change the answer at 100k documents/day
+| variable | défaut | signification |
+|---|---|---|
+| `STORAGE_ROOT` | `/data/uploads` | où écrit l'object store POSIX |
+| `MAX_UPLOAD_BYTES` | `104857600` | limite par fichier, 100 Mio |
+| `MAX_BODY_OVERHEAD_BYTES` | `1048576` | marge au-dessus, pour le cadre multipart |
+| `UPLOAD_CHUNK_BYTES` | `1048576` | taille de chunk en lecture/écriture |
+| `PARTNER_HMAC_SECRET` | placeholder de dev | secret partagé du webhook |
+| `PARTNER_WEBHOOK_SIGNING_HELPER` | `true` | expose l'oracle de signature de `/docs` |
+| `LOG_LEVEL` / `LOG_FORMAT` | `INFO` / `json` | `console` pour une exécution locale lisible |
+| `DB_ECHO` | `false` | écho SQL, indépendant de `LOG_LEVEL` |
 
-## Authentication and tenancy
+## Dépendances
 
-Access tokens are JWTs (`JWT_ACCESS_TTL_SECONDS`, 6h default). Refresh tokens
-are opaque, stored as a SHA-256 hash, and rotated on every use; replaying a
-consumed one revokes its whole family. Auth is a FastAPI dependency rather than
-middleware, so it stays off `/health` and shows up in the OpenAPI schema.
-
-Tenant isolation is enforced twice. Repositories filter on `org_id`, and
-Postgres row-level security keys off `app.current_org_id`, which the request
-session sets per transaction. The application connects as `app_rw`, which is
-subject to those policies; a separate `app_auth` role holds `BYPASSRLS` and is
-used only for lookups that precede authentication — user by email, refresh
-token by hash — plus seeding.
-
-## Dependencies
-
-`uv.lock` is committed and is the source of truth. Never hand-edit it.
+`uv.lock` est commité et fait foi. Ne jamais l'éditer à la main.
 
 ```bash
-uv add <package>             # runtime dependency
-uv add --dev <package>       # dev-only dependency
-uv lock --upgrade            # refresh the lock
+uv add <package>             # dépendance runtime
+uv add --dev <package>       # dépendance de développement
+uv lock --upgrade            # rafraîchir le lock
 ```
 
-The Docker build runs `uv sync --locked`, which **fails** if `uv.lock` is stale
-relative to `pyproject.toml`. Commit both together.
+Le build Docker exécute `uv sync --locked`, qui **échoue** si `uv.lock` est
+désynchronisé de `pyproject.toml`. Commitez les deux ensemble.
 
-## Layout
+## À propos de l'image Docker
 
-```
-app/domain/          entities, ports (Protocols), errors — no I/O, no framework
-app/application/     use cases: login, refresh, logout, upload_document
-app/infrastructure/  SQLAlchemy, argon2, PyJWT, POSIX object store — the adapters
-app/api/             FastAPI routers, dependencies, error mapping
-app/pipeline/        DBOS steps and workflow; steps.py is the statement verbatim, body-size guard
-app/config.py        settings, all env-driven
-app/seed.py          idempotent development seed
-app/main.py          app factory and the /health endpoint
-scripts/             simulate_pipeline.py — where the latency numbers come from
-migrations/          Alembic; 0001 schema/roles/RLS; 0002 documents; 0003 pipeline; 0004 listing index
-tests/unit/          use cases against in-memory fakes
-tests/api/           routes with the adapters overridden
-tests/integration/   real Postgres; proves RLS. Skipped without TEST_POSTGRES_DSN
-Dockerfile           multi-stage build, distroless runtime
-compose.yaml         db, migrate, seed, api
-pyproject.toml       deps, ruff and pytest config
-```
+1. **builder** (`ghcr.io/astral-sh/uv`) — installe un CPython 3.14 relocalisable
+   dans `/opt/python` et les dépendances verrouillées dans `/app/.venv`. Les
+   dépendances sont installées avant la copie des sources, donc éditer du code
+   n'invalide pas la couche de dépendances.
+2. **runtime** (`gcr.io/distroless/cc-debian12:nonroot`) — copie l'interpréteur,
+   le venv et `app/`. Pas de shell, pas de gestionnaire de paquets, pas de
+   `pip`/`uv` ; tourne en uid 65532.
 
-Dependencies point inward only: `domain` imports nothing but the standard
-library, `application` imports `domain`, `infrastructure` implements the
-domain's ports, and `api` wires them together.
-
-## Logging
-
-Structured JSON on stdout. Application code uses the standard library
-(`logging.getLogger(__name__)`); structlog is configured once in
-`app/observability.py` as the renderer, so no layer gains a dependency on it.
-
-Every response carries `X-Request-Id`, and that id is bound to every log line
-for the request — including `org_id` and `user_id` once authenticated. Work that
-outlives the request is correlated by `document_id` and `workflow_id` instead.
-
-| variable | default | meaning |
-|---|---|---|
-| `LOG_LEVEL` | `INFO` | root level; `DEBUG` also unmutes SQL and DBOS |
-| `LOG_FORMAT` | `json` | `console` for a readable local run |
-
-[docs/observability.md](docs/observability.md) covers what each level is for,
-what is never logged, and the two footguns this configuration disarms.
-
-## Security headers
-
-`SecurityHeadersMiddleware` (`app/api/security_headers.py`) applies the OWASP
-header set to every response, including ones produced by other middleware. The
-values come from [`secure`](https://github.com/TypeError/secure)'s `STRICT`
-preset rather than being written by hand, so they track that library rather than
-drifting with us.
-
-Only the Content-Security-Policy is chosen locally, keyed on the response's
-`Content-Type` rather than on a path list:
-
-- **JSON** (everything the API returns) gets `default-src 'none'` — a JSON body
-  renders nothing, so it should be able to load nothing.
-- **HTML** (`/docs`, `/redoc`) gets a policy permitting the jsdelivr CDN, Google
-  Fonts and the favicon host that FastAPI's docs pages load from, and drops
-  `Cross-Origin-Embedder-Policy`, whose `require-corp` value would block those
-  CDN assets.
-
-`tests/api/test_security_headers.py` parses the real docs HTML and asserts every
-external asset it references is permitted by the CSP actually served — a strict
-CSP otherwise blanks out Swagger while still returning `200`.
-
-The `Server` banner is suppressed by uvicorn's `--no-server-header` in the
-Dockerfile, not by the middleware: uvicorn appends its banner after the ASGI app
-has returned, so setting it in application code produces two `Server` headers.
-
-## Document uploads
-
-`POST /documents` streams a multipart upload into an `ObjectStore` and records a
-row; `GET /documents` lists the caller's organization. Both take the organization
-and the uploader from the bearer token — neither is a request parameter.
-
-Only PDFs are accepted, decided by sniffing the file's leading bytes with
-`puremagic` — never by the `Content-Type` the client sent, which is a claim
-rather than evidence. A PNG renamed `report.pdf` and declared `application/pdf`
-gets a `415`. The sniffed type is what gets recorded, so a genuine PDF uploaded
-as `application/octet-stream` is stored as `application/pdf`.
-
-The listing is newest-first and paged by cursor, not offset: pass the previous
-response's `next_cursor` back as `?cursor=`, and stop when it comes back null.
-Each row carries the document's name, id, processing status, import date, and
-the user who imported it (id, name, email, from a join to `users`).
-
-| variable | default | meaning |
-|---|---|---|
-| `STORAGE_ROOT` | `/data/uploads` | where the POSIX backend writes; a compose volume |
-| `MAX_UPLOAD_BYTES` | `104857600` | per-file limit, 100 MiB |
-| `MAX_BODY_OVERHEAD_BYTES` | `1048576` | slack above it for multipart framing |
-| `UPLOAD_CHUNK_BYTES` | `1048576` | read/write chunk size |
-
-For a host-side run, point `STORAGE_ROOT` somewhere writable (`STORAGE_ROOT=./var/uploads`).
-
-The rationale — the storage port's atomicity contract, why the size limit is
-enforced in two places, and when to move to presigned S3 uploads — is in
-[docs/upload-architecture.md](docs/upload-architecture.md). The read side —
-why keyset paging, what is in the cursor, the measured cost against 2M rows,
-and why GraphQL is the better long-term shape — is in
-[docs/document-listing.md](docs/document-listing.md).
-
-`[tool.uv] package = false` — this is an application, not a library, so nothing
-is built or installed as a package. `pytest` finds `app/` via
-`pythonpath = ["."]`.
-
-## About the Docker image
-
-Two stages:
-
-1. **builder** (`ghcr.io/astral-sh/uv`) — installs a relocatable CPython 3.14
-   into `/opt/python` and the locked dependencies into `/app/.venv`. Deps are
-   installed before the source is copied, so editing code does not invalidate
-   the dependency layer.
-2. **runtime** (`gcr.io/distroless/cc-debian12:nonroot`) — copies the
-   interpreter, the venv and `app/`. No shell, no package manager, no
-   `pip`/`uv`; runs as uid 65532.
-
-The base is `cc` rather than distroless' `python3` because we ship our own
-CPython 3.14 instead of inheriting whatever version that image currently
-carries — that image lags well behind the current release. `cc` supplies the
-glibc/libstdc++ that the interpreter and the compiled wheels (uvloop,
-httptools, pydantic-core) link against.
-
-Since there is no shell in the image, the Compose healthcheck cannot use
-`curl` or a shell one-liner. It invokes the bundled interpreter directly in
-exec form; keep that in mind if you change the probe.
