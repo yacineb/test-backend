@@ -21,10 +21,10 @@ le détail.
 | API | **FastAPI** + Pydantic v2 | imposé, et le schéma OpenAPI sert de contrat exerçable depuis `/docs` |
 | Base | **PostgreSQL 17**, SQLAlchemy 2 async, asyncpg, Alembic | la seule dépendance stateful du système |
 | Isolation tenant | **RLS Postgres** + rôle applicatif sans `BYPASSRLS` | l'isolation tient même si le code applicatif a un bug |
-| Orchestration | **DBOS Transact** (exécution durable, checkpointing) | une bibliothèque au-dessus de Postgres, pas un cluster de plus |
+| Orchestration | **DBOS Transact** (exécution durable, checkpointing) | une bibliothèque au-dessus de Postgres, pas un cluster de plus — le comparatif avec Celery, Temporal et Restate est en [orchestration.md](docs/orchestration.md) |
 | Temps réel | **SSE** sur `LISTEN/NOTIFY` Postgres | ~80 ms bout en bout, zéro service ajouté |
 | Stockage fichiers | port `ObjectStore`, adaptateur POSIX | contrat « complet ou absent », prêt pour S3 (F1) |
-| Auth | JWT d'accès + refresh opaque rotatif | volontairement jetable : à déléguer à un IdP managé (F10) |
+| Auth | JWT d'accès + refresh opaque rotatif | volontairement jetable : à déléguer à un IdP managé (F10) — le détail est en [authentification.md](docs/authentification.md) |
 | Détection de type | **puremagic** sur les octets de tête | jamais le `Content-Type` annoncé par le client |
 | Sécurité HTTP | **secure** (preset `STRICT`) + CSP maison | les en-têtes suivent la bibliothèque, la CSP suit le `Content-Type` |
 | Logs | **structlog** en rendu, stdlib aux points d'appel | aucune couche métier ne dépend de structlog |
@@ -37,7 +37,9 @@ Les décisions structurantes, en une phrase chacune :
    progression. Pas de broker, pas de cache.
 2. **L'exécution durable plutôt qu'une file de tâches.** Le pipeline est un
    workflow avec un point de suspension externe (`awaiting_partner`), pas une
-   suite de tâches indépendantes.
+   suite de tâches indépendantes. Le comparatif avec Celery, en détail :
+   [orchestration.md §3](docs/orchestration.md) et
+   [decisions-et-limites.md §2](docs/decisions-et-limites.md).
 3. **Le tenant vient du token, et rien d'autre.** `org_id` n'est un paramètre
    d'aucune API : uploader chez un autre tenant n'est pas une requête qu'on
    refuse, c'est une requête qu'on ne peut pas exprimer.
@@ -135,9 +137,9 @@ test sont dans [CONTRIBUTING.md](CONTRIBUTING.md).
 ## Parcours de lecture
 
 **Lisez la première ligne.** C'est l'argumentaire complet du rendu, et il pointe
-vers le reste là où vous voudrez creuser une affirmation précise. Les sept autres
+vers le reste là où vous voudrez creuser une affirmation précise. Les huit autres
 sont de la profondeur à la demande — mesures, plans de requête, contrats — pas
-une file d'attente à écouler. Les huit ensemble : environ 88 minutes en lecture
+une file d'attente à écouler. Les neuf ensemble : environ 99 minutes en lecture
 attentive, moitié moins en survol.
 
 | Document | La question à laquelle il répond | ~min |
@@ -145,6 +147,7 @@ attentive, moitié moins en survol.
 | **[decisions-et-limites.md](docs/decisions-et-limites.md)** | **Chaque choix défendu face aux cibles de scale ; ce qui n'est volontairement pas construit et ce qui forcerait à le faire ; la suite, dans l'ordre** | **24** |
 | [orchestration.md](docs/orchestration.md) | Pourquoi DBOS plutôt que Temporal, Restate, Celery ou une file maison — et pourquoi le débit ne pouvait pas trancher | 7 |
 | [architecture-upload.md](docs/architecture-upload.md) | La table `documents`, le contrat de stockage, pourquoi la limite de taille est appliquée deux fois, d'où vient le tenant | 15 |
+| [authentification.md](docs/authentification.md) | Pourquoi le refresh n'est pas un JWT, comment un rejeu tue la session, pourquoi il y a deux rôles Postgres | 11 |
 | [liste-documents.md](docs/liste-documents.md) | Pagination keyset mesurée sur 2M lignes, ce que contient le curseur, pourquoi cet endpoint devrait finir en GraphQL | 11 |
 | [pipeline.md](docs/pipeline.md) | Le DAG, la politique de retry mesurée, la projection, et comment la progression arrive au client en ~80 ms | 12 |
 | [webhook-entrant.md](docs/webhook-entrant.md) | Signature sur les octets bruts, fenêtre anti-rejeu, codes de statut, idempotence | 6 |

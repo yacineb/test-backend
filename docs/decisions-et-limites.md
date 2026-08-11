@@ -95,8 +95,12 @@ Tout ce qui suit est défendu face à ces nombres, et non seulement mon intuitio
 ### Pourquoi Celery serait un mauvais choix ici
 
 Ce n'est pas un jugement de qualité — Celery est mature, largement exploité,
-facile à recruter. C'est la mauvaise *forme* : une file de tâches, là où on a un
-workflow avec état et un point de suspension externe.
+facile à recruter — et ce n'est pas un jugement qui vaut partout : pour une
+équipe qui l'exploite déjà en production, la plupart des objections ci-dessous
+portent sur *l'ajout* d'un broker plutôt que sur la vie avec, et la familiarité
+vaut de l'argent. Sur un service greenfield, c'est la mauvaise *forme* : une
+file de tâches, là où on a un workflow avec état et un point de suspension
+externe.
 
 - **Il ajoute un second domaine de durabilité pour 0,07 job/seconde.** Le broker
   porte l'état de la file, Postgres l'état du document, et rien ne les garde
@@ -129,10 +133,6 @@ workflow avec état et un point de suspension externe.
 - **L'observabilité est en forme de tâche, pas de document.** Flower montre des
   événements de tâche. Répondre à « où en est le document X, et pourquoi »
   demande de corréler des logs.
-- **Contrepoint honnête :** pour une équipe qui exploite déjà Celery en
-  production, la plupart de ces objections portent sur *l'ajout* d'un broker
-  plutôt que sur la vie avec, et la familiarité vaut de l'argent. Cet argument ne
-  s'applique pas à un service greenfield.
 
 ### Simplicité, robustesse, et migration path
 
@@ -171,6 +171,7 @@ consacré. Ce tableau est là pour y aller directement.
 | Sujet | Où c'est argumenté |
 |---|---|
 | Tenant issu du token, les quatre niveaux, `app_rw` sans `BYPASSRLS`, preuves RLS par SQL non filtré | [architecture-upload.md §5](architecture-upload.md) |
+| Access JWT contre refresh opaque, rotation et révocation de famille, oracle d'énumération fermé, les deux rôles Postgres | [authentification.md](authentification.md) |
 | Octets avant la ligne, `storage_key` serveur, contrat `ObjectStore`, double plafond de taille, PDF décidé sur les octets | [architecture-upload.md §1–§4, §6](architecture-upload.md) |
 | Page comme position, curseur `(created_at, id)` opaque et non signé, index, jointure uploader | [liste-documents.md §2–§4](liste-documents.md) |
 | Projection à sens unique, quatre lignes de step dès la création, politique de retry mesurée, trigger `NOTIFY` et SSE | [pipeline.md](pipeline.md) |
@@ -178,7 +179,7 @@ consacré. Ce tableau est là pour y aller directement.
 | Réponse du partenaire gardée et non jetée, `409` tant que ce n'est pas `ready`, ce qui n'est pas rendu | [donnees-extraites.md](donnees-extraites.md) |
 | Clés de corrélation, niveaux de log, ce qui n'est jamais loggé | [observabilite.md](observabilite.md) |
 
-Quatre choix n'ont pas de document dédié et tiennent en quatre points :
+Deux choix n'ont pas de document dédié et tiennent en deux points :
 
 - **Les en-têtes de sécurité viennent d'une bibliothèque**, pas de chaînes
   écrites à la main : `SecurityHeadersMiddleware` applique le preset `STRICT` de
@@ -189,13 +190,6 @@ Quatre choix n'ont pas de document dédié et tiennent en quatre points :
   chargent les pages FastAPI. `tests/api/test_security_headers.py` parse le vrai
   HTML des docs et asserte que chaque asset référencé est autorisé par la CSP
   servie, sinon une CSP stricte blanchit Swagger tout en renvoyant `200`.
-- **L'auth est une dépendance, pas un middleware**, donc elle reste hors de
-  `/health` et apparaît dans le schéma OpenAPI, où un relecteur voit quelles
-  routes sont protégées.
-- **Les refresh tokens sont opaques, stockés en SHA-256, tournés à chaque
-  usage ; rejouer un token consommé révoque toute la famille.** Détecter le vol
-  est le but — et la révocation doit survivre à l'exception levée juste après,
-  d'où un `UnitOfWork.commit` explicite plutôt qu'implicite.
 - **Les ports sont des `Protocol`, pas des ABC**, et `app/domain` n'importe que
   la bibliothèque standard. Les adaptateurs les satisfont structurellement :
   l'infrastructure n'importe jamais le domaine pour en hériter, les tests
@@ -237,12 +231,17 @@ jamais, le document reste en `awaiting_partner` sans rien pour l'en sortir. La
 requête de détection est `document_steps.ended_at` du step `external_call`,
 au-delà d'un seuil, document toujours en `awaiting_partner`.
 
-**L7 — Un crash entre l'acceptation par le partenaire et le commit du checkpoint
-produit un job en double.** À la reprise, `external_call` est réexécuté : le
-partenaire émet un second `job_id`, et le premier — jamais enregistré — répondra
-`404` pour toujours quand il rappellera. Inhérent à tout appel sortant non
-idempotent ; la correction est un job de réconciliation plus une clé
-d'idempotence sur la requête partenaire, pas un autre orchestrateur.
+**L7 — Un `external_call` réexécuté produit un job en double.** Le partenaire
+émet un second `job_id`, et le premier — jamais enregistré — répondra `404` pour
+toujours quand il rappellera. Inhérent à tout appel sortant non idempotent ; la
+correction est un job de réconciliation plus une clé d'idempotence sur la
+requête partenaire, pas un autre orchestrateur.
+
+Le crash entre l'acceptation par le partenaire et le commit du checkpoint est le
+déclencheur évident, mais pas le plus fréquent : une `ConnectionError` après que
+le partenaire a accepté est indiscernable d'une requête jamais arrivée, et le
+step repart alors sur sa politique de retry ordinaire — sans crash. C'est le
+chemin nominal, pas le cas dégradé.
 
 **L8 — 1,6 % des documents sont abandonnés.** ~1 600/jour à la cible, sans deadletter table/queue ni endpoint de replay. Le checkpointing fait qu'un rejeu
 *reprendrait* au lieu de recommencer ; rien ne l'expose encore.
@@ -276,7 +275,10 @@ il n'y a pas d'UI, et inventer l'endpoint maintenant serait spéculatif.
 **L13 — L'auth est faite maison, et ce n'est pas une cible de production.**
 Émission et validation de JWT, rotation des refresh et révocation de famille sont
 implémentées ici pour que l'exercice soit exerçable de bout en bout. En
-production, j'aurai délégué à un fournisseur d'identité managé, avec OIDC.
+production, j'aurai délégué à un fournisseur d'identité managé, avec OIDC. Ce qui
+manque nommément — révocation d'un access token avant son `exp`, limitation de
+débit sur le login, purge des refresh, inscription et reset — est listé en fin de
+[authentification.md](authentification.md).
 
 **L14 — La liste n'a ni filtre, ni tri, ni pagination arrière, ni total.**
 Chaque filtre interagit avec la clé de tri, donc avec le curseur, et un prédicat
