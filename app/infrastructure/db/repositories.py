@@ -438,9 +438,22 @@ class UnscopedDocumentRepository:
         written. The payload is stored either way - a failure's `result` is the
         only account of why the partner refused the document.
         """
+        # The awaiting_partner predicate is the idempotency guarantee, and it
+        # has to live here rather than in a status check the caller made
+        # earlier: read-then-write is two statements, and two concurrent
+        # deliveries of the same job_id both pass a check made in Python.
+        #
+        # As one conditional UPDATE it is a compare-and-swap. The second writer
+        # blocks on the row lock, then re-evaluates this WHERE against the row
+        # the first one committed - awaiting_partner no longer matches, so it
+        # updates nothing. That re-evaluation is what makes READ COMMITTED
+        # enough; nothing here needs a stricter isolation level or FOR UPDATE.
         await self._session.execute(
             update(DocumentRow)
-            .where(DocumentRow.id == document_id)
+            .where(
+                DocumentRow.id == document_id,
+                DocumentRow.status == DocumentStatus.AWAITING_PARTNER,
+            )
             .values(
                 status=status,
                 partner_result=result,
