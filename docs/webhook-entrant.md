@@ -78,10 +78,24 @@ obligations qu'il porte :
 - **Lever `UnknownPartnerJob`** quand rien n'attend ce `job_id`, ce que le
   gestionnaire d'erreurs traduit en `404`.
 - **Être idempotent.** Les partenaires rejouent, donc le même `job_id` arrivera
-  deux fois. L'implémentation est une mise à jour conditionnelle sur l'état
-  courant du document, pas une table de déduplication à part : un document sorti
-  de `awaiting_partner` est décidé, et une reprise obsolète ne doit pas faire
-  basculer un document `ready` en `failed`.
+  deux fois. Un document sorti de `awaiting_partner` est décidé, et une reprise
+  obsolète ne doit pas faire basculer un document `ready` en `failed`.
+
+  La garantie est une `UPDATE` conditionnelle — `WHERE id = … AND status =
+  'awaiting_partner'` — et non une table de déduplication à part. Le prédicat
+  est *dans* la requête pour une raison : le lire d'abord en Python, puis
+  écrire, fait deux instructions, et deux livraisons concurrentes du même
+  `job_id` voient toutes les deux `awaiting_partner` avant que l'une ait
+  commité. En une seule `UPDATE`, c'est un compare-and-swap : le second
+  écrivain bloque sur le verrou de ligne, puis réévalue le `WHERE` sur la ligne
+  que le premier a commitée, ne correspond plus, et n'écrit rien. C'est cette
+  réévaluation qui rend `READ COMMITTED` suffisant — ni `FOR UPDATE`, ni
+  niveau d'isolation plus strict. Le premier arrivé décide ; `occurred_at`
+  n'arbitre pas, un partenaire n'étant pas censé émettre deux issues
+  différentes pour un même job.
+
+  Le test en Python (`is_duplicate`) reste, mais comme premier filtre qui évite
+  l'écriture inutile sur la reprise qu'on voit venir, pas comme la garantie.
 - **Garder le `result`.** Le payload et l'`occurred_at` signé sont écrits dans
   `documents` par la même `UPDATE` que le statut, et rendus par
   `GET /documents/{id}/data`. Authentifier un champ sous la signature puis le
